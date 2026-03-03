@@ -1,0 +1,46 @@
+name: PipePipeMVP
+options:
+  bundleIdPrefix: org.pipepipe
+packages:
+  KSPlayer:
+    url: https://github.com/kingslay/KSPlayer
+    exactVersion: 2.1.2
+targets:
+  PipePipeMVP:
+    type: application
+    platform: iOS
+    deploymentTarget: "16.0"
+    sources:
+      - PipePipeMVP
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: org.pipepipe.mvp
+        INFOPLIST_FILE: PipePipeMVP/Info.plist
+        SWIFT_VERSION: 5.0
+        TARGETED_DEVICE_FAMILY: "1,2"
+        SUPPORTS_MACCATALYST: NO
+    dependencies:
+      - package: KSPlayer
+        product: KSPlayer
+    postBuildScripts:
+      - name: Fix KSPlayer Framework Bundle ID
+        script: |
+          FIXED_BUNDLE_ID="com.kintan.ksplayer.libshaderccombined"
+          FRAMEWORK_PATH="${TARGET_BUILD_DIR}/${FRAMEWORKS_FOLDER_PATH}/libshaderc_combined.framework"
+          PLIST_PATH="${FRAMEWORK_PATH}/Info.plist"
+          if [ ! -f "${PLIST_PATH}" ]; then
+            exit 0
+          fi
+
+          /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier ${FIXED_BUNDLE_ID}" "${PLIST_PATH}" || \
+          /usr/libexec/PlistBuddy -c "Add :CFBundleIdentifier string ${FIXED_BUNDLE_ID}" "${PLIST_PATH}"
+
+          if [ -n "${EXPANDED_CODE_SIGN_IDENTITY}" ]; then
+            /usr/bin/codesign --force --sign "${EXPANDED_CODE_SIGN_IDENTITY}" \
+              --identifier "${FIXED_BUNDLE_ID}" \
+              --preserve-metadata=entitlements "${FRAMEWORK_PATH}"
+          fi
+
+          exit 0
+    scheme:
+      testTargets: []

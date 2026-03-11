@@ -3,7 +3,7 @@
 	archiveVersion = 1;
 	classes = {
 	};
-	objectVersion = 77;
+	objectVersion = 63;
 	objects = {
 
 /* Begin PBXBuildFile section */
@@ -32,7 +32,7 @@
 		5674F333091F43153657940E /* YouTubeSearchService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = YouTubeSearchService.swift; sourceTree = "<group>"; };
 		6270D5381961FFEB0ECA0147 /* YouTubeSearchModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = YouTubeSearchModels.swift; sourceTree = "<group>"; };
 		8D8037F9E91B5A18423B067C /* PlayerSurfaceView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlayerSurfaceView.swift; sourceTree = "<group>"; };
-		9137F60E86CDEA84BE7AE911 /* YourPipe.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = YourPipe.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		9137F60E86CDEA84BE7AE911 /* YourPipe.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = YourPipe.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		AF5D4C97EB6993D62B6D65B2 /* VideoPlaybackScreen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VideoPlaybackScreen.swift; sourceTree = "<group>"; };
 		BCBD0D7FCD7CA7B871237220 /* PlaybackController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlaybackController.swift; sourceTree = "<group>"; };
 		C3C82A9E0B6B60BBAB22FD2C /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
@@ -131,7 +131,6 @@
 			);
 			mainGroup = 12F010CE47549E32E5C11A73;
 			minimizedProjectReferenceProxies = 1;
-			preferredProjectObjectVersion = 77;
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
@@ -247,6 +246,7 @@
 				CODE_SIGN_IDENTITY = "iPhone Developer";
 				CODE_SIGN_STYLE = Automatic;
 				DEVELOPMENT_ASSET_PATHS = "\"YourPipe/Preview Content\"";
+				DEVELOPMENT_TEAM = HFR946NW67;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = YourPipe/Info.plist;
 				INFOPLIST_KEY_LSRequiresIPhoneOS = YES;
@@ -330,6 +330,7 @@
 				CODE_SIGN_IDENTITY = "iPhone Developer";
 				CODE_SIGN_STYLE = Automatic;
 				DEVELOPMENT_ASSET_PATHS = "\"YourPipe/Preview Content\"";
+				DEVELOPMENT_TEAM = HFR946NW67;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = YourPipe/Info.plist;
 				INFOPLIST_KEY_LSRequiresIPhoneOS = YES;

@@ -11,6 +11,9 @@ actor YouTubePlaybackService {
     private let iosUserAgentVersion = "18_7_2"
     private let webUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Safari/605.1.15"
     private let nonceAlphabet = Array("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_")
+    private let decoderBaseURL = "https://api.pipepipe.dev/decoder/decode"
+    private let decoderUserAgent = "PipePipe/4.7.0"
+    private var decoderCache: [String: String] = [:]
 
     init(session: URLSession = .shared) {
         self.session = session
@@ -29,6 +32,7 @@ actor YouTubePlaybackService {
         case invalidResponse
         case invalidJSON
         case httpStatus(Int, String)
+        case decoderFailed
         case noPlayableStream
 
         var errorDescription: String? {
@@ -41,6 +45,8 @@ actor YouTubePlaybackService {
                 return "Не удалось разобрать ответ плеера."
             case .httpStatus(let code, _):
                 return "Ошибка загрузки видео: HTTP \(code)."
+            case .decoderFailed:
+                return "Не удалось декодировать параметры потока."
             case .noPlayableStream:
                 return "Для этого видео не найден встроенный поток воспроизведения."
             }
@@ -115,31 +121,52 @@ actor YouTubePlaybackService {
 
         logStreamingDataIfNeeded(root: root, source: "InnerTube")
 
-        let title = (root["videoDetails"] as? [String: Any])?["title"] as? String
-        let channelName = (root["videoDetails"] as? [String: Any])?["author"] as? String
-        let channelId = (root["videoDetails"] as? [String: Any])?["channelId"] as? String
+        let videoDetails = root["videoDetails"] as? [String: Any]
+        let title = videoDetails?["title"] as? String
+        let channelName = videoDetails?["author"] as? String
+        let channelId = videoDetails?["channelId"] as? String
+        let isLiveContent = videoDetails?["isLiveContent"] as? Bool ?? false
+        let playerId = await resolvePlayerId(videoId: videoId, root: root)
+#if DEBUG
+        print("[YouTubePlaybackService] playerId=\(playerId ?? "none")")
+#endif
 
-        if let hls = ((root["streamingData"] as? [String: Any])?["hlsManifestUrl"] as? String),
-           let url = URL(string: hls) {
+        let formats = ((root["streamingData"] as? [String: Any])?["formats"] as? [[String: Any]]) ?? []
+        let hlsURLString = (root["streamingData"] as? [String: Any])?["hlsManifestUrl"] as? String
+
+        if !isLiveContent {
+            if let directURL = await pickBestMuxedMP4URL(from: formats, playerId: playerId) {
+#if DEBUG
+                print("[YouTubePlaybackService] InnerTube: using muxed format url")
+#endif
+                return PlaybackData(
+                    streamURL: directURL,
+                    title: title,
+                    channelName: channelName,
+                    channelId: channelId,
+                    headers: streamHeaders(videoId: videoId, userAgent: iosUserAgent(countryCode: "US"))
+                )
+            }
+            if let hlsURLString, let url = URL(string: hlsURLString) {
+#if DEBUG
+                print("[YouTubePlaybackService] InnerTube: using hlsManifestUrl")
+#endif
+                let finalURL = await decodeThrottlingIfNeeded(url: url, playerId: playerId)
+                return PlaybackData(
+                    streamURL: finalURL,
+                    title: title,
+                    channelName: channelName,
+                    channelId: channelId,
+                    headers: streamHeaders(videoId: videoId, userAgent: iosUserAgent(countryCode: "US"))
+                )
+            }
+        } else if let hlsURLString, let url = URL(string: hlsURLString) {
 #if DEBUG
             print("[YouTubePlaybackService] InnerTube: using hlsManifestUrl")
 #endif
+            let finalURL = await decodeThrottlingIfNeeded(url: url, playerId: playerId)
             return PlaybackData(
-                streamURL: url,
-                title: title,
-                channelName: channelName,
-                channelId: channelId,
-                headers: streamHeaders(videoId: videoId, userAgent: iosUserAgent(countryCode: "US"))
-            )
-        }
-
-        let formats = ((root["streamingData"] as? [String: Any])?["formats"] as? [[String: Any]]) ?? []
-        if let directURL = pickBestMuxedMP4URL(from: formats) {
-#if DEBUG
-            print("[YouTubePlaybackService] InnerTube: using muxed format url")
-#endif
-            return PlaybackData(
-                streamURL: directURL,
+                streamURL: finalURL,
                 title: title,
                 channelName: channelName,
                 channelId: channelId,
@@ -175,31 +202,39 @@ actor YouTubePlaybackService {
 
         logStreamingDataIfNeeded(root: root, source: "WatchPage")
 
-        let title = (root["videoDetails"] as? [String: Any])?["title"] as? String
-        let channelName = (root["videoDetails"] as? [String: Any])?["author"] as? String
-        let channelId = (root["videoDetails"] as? [String: Any])?["channelId"] as? String
+        let videoDetails = root["videoDetails"] as? [String: Any]
+        let title = videoDetails?["title"] as? String
+        let channelName = videoDetails?["author"] as? String
+        let channelId = videoDetails?["channelId"] as? String
+        let isLiveContent = videoDetails?["isLiveContent"] as? Bool ?? false
+        let playerId = await resolvePlayerId(videoId: videoId, root: root)
+#if DEBUG
+        print("[YouTubePlaybackService] playerId=\(playerId ?? "none")")
+#endif
 
         let streamingData = root["streamingData"] as? [String: Any]
-        if let hls = streamingData?["hlsManifestUrl"] as? String,
-           let url = URL(string: hls) {
+        let hlsURLString = streamingData?["hlsManifestUrl"] as? String
+        if let formats = streamingData?["formats"] as? [[String: Any]] {
+            if !isLiveContent, let directURL = await pickBestMuxedMP4URL(from: formats, playerId: playerId) {
+#if DEBUG
+                print("[YouTubePlaybackService] WatchPage: using muxed format url")
+#endif
+                return PlaybackData(
+                    streamURL: directURL,
+                    title: title,
+                    channelName: channelName,
+                    channelId: channelId,
+                    headers: streamHeaders(videoId: videoId, userAgent: webUserAgent)
+                )
+            }
+        }
+        if let hlsURLString, let url = URL(string: hlsURLString) {
 #if DEBUG
             print("[YouTubePlaybackService] WatchPage: using hlsManifestUrl")
 #endif
+            let finalURL = await decodeThrottlingIfNeeded(url: url, playerId: playerId)
             return PlaybackData(
-                streamURL: url,
-                title: title,
-                channelName: channelName,
-                channelId: channelId,
-                headers: streamHeaders(videoId: videoId, userAgent: webUserAgent)
-            )
-        }
-        if let formats = streamingData?["formats"] as? [[String: Any]],
-           let directURL = pickBestMuxedMP4URL(from: formats) {
-#if DEBUG
-            print("[YouTubePlaybackService] WatchPage: using muxed format url")
-#endif
-            return PlaybackData(
-                streamURL: directURL,
+                streamURL: finalURL,
                 title: title,
                 channelName: channelName,
                 channelId: channelId,
@@ -210,13 +245,12 @@ actor YouTubePlaybackService {
         throw PlaybackError.noPlayableStream
     }
 
-    private func pickBestMuxedMP4URL(from formats: [[String: Any]]) -> URL? {
+    private func pickBestMuxedMP4URL(from formats: [[String: Any]], playerId: String?) async -> URL? {
         let muxed = formats.filter { isMuxedMP4($0) }
 
         // Prefer itag=18 (H.264 + AAC, muxed MP4) when available.
         if let itag18 = muxed.first(where: { ($0["itag"] as? Int) == 18 }),
-           let urlString = itag18["url"] as? String,
-           let url = URL(string: urlString) {
+           let url = await resolvePlayableURL(from: itag18, playerId: playerId) {
             return url
         }
 
@@ -232,7 +266,7 @@ actor YouTubePlaybackService {
         }
 
         for item in sorted {
-            if let urlString = item["url"] as? String, let url = URL(string: urlString) {
+            if let url = await resolvePlayableURL(from: item, playerId: playerId) {
                 return url
             }
         }
@@ -246,7 +280,7 @@ actor YouTubePlaybackService {
         return lower.contains("video/mp4")
             && lower.contains("avc1")
             && lower.contains("mp4a")
-            && item["url"] != nil
+            && (item["url"] != nil || item["signatureCipher"] != nil || item["cipher"] != nil)
     }
 
     private func extractPlayerResponseJSON(from html: String) -> String? {
@@ -265,6 +299,183 @@ actor YouTubePlaybackService {
 
     private func iosUserAgent(countryCode: String) -> String {
         "com.google.ios.youtube/\(iosClientVersion)(\(iosDeviceModel); U; CPU iOS \(iosUserAgentVersion) like Mac OS X; \(countryCode))"
+    }
+
+    private func extractPlayerId(from root: [String: Any]) -> String? {
+        if let assets = root["assets"] as? [String: Any],
+           let js = assets["js"] as? String,
+           let id = parsePlayerId(from: js) {
+            return id
+        }
+        if let playerConfig = root["playerConfig"] as? [String: Any],
+           let js = playerConfig["jsUrl"] as? String,
+           let id = parsePlayerId(from: js) {
+            return id
+        }
+        return nil
+    }
+
+    private func resolvePlayerId(videoId: String, root: [String: Any]) async -> String? {
+        if let direct = extractPlayerId(from: root) {
+            return direct
+        }
+        return await fetchPlayerIdFromWatchPage(videoId: videoId)
+    }
+
+    private func fetchPlayerIdFromWatchPage(videoId: String) async -> String? {
+        let watchURLString = "https://www.youtube.com/watch?v=\(videoId)"
+        guard let url = URL(string: watchURLString) else { return nil }
+
+        var request = URLRequest(url: url)
+        request.setValue(webUserAgent, forHTTPHeaderField: "User-Agent")
+        request.setValue("CONSENT=YES+1", forHTTPHeaderField: "Cookie")
+
+        do {
+            let (data, response) = try await session.data(for: request)
+            guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
+                return nil
+            }
+            guard var html = String(data: data, encoding: .utf8) else { return nil }
+            html = html.replacingOccurrences(of: "\\u002F", with: "/")
+            return parsePlayerId(from: html)
+        } catch {
+            return nil
+        }
+    }
+
+    private func parsePlayerId(from jsURL: String) -> String? {
+        let pattern = #"/s/player/([a-zA-Z0-9_-]{8,})/"#
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }
+        let range = NSRange(jsURL.startIndex..., in: jsURL)
+        guard let match = regex.firstMatch(in: jsURL, options: [], range: range),
+              match.numberOfRanges > 1,
+              let idRange = Range(match.range(at: 1), in: jsURL) else {
+            return nil
+        }
+        let full = String(jsURL[idRange])
+        if full.count > 8 {
+            return String(full.prefix(8))
+        }
+        return full
+    }
+
+    private func resolvePlayableURL(from item: [String: Any], playerId: String?) async -> URL? {
+        if let urlString = item["url"] as? String, let url = URL(string: urlString) {
+            return await decodeThrottlingIfNeeded(url: url, playerId: playerId)
+        }
+        let cipher = item["signatureCipher"] as? String ?? item["cipher"] as? String
+        guard let cipher else { return nil }
+        return await decodeCipherURL(cipher, playerId: playerId)
+    }
+
+    private func decodeCipherURL(_ cipher: String, playerId: String?) async -> URL? {
+        let params = parseQueryString(cipher)
+        guard let urlString = params["url"], let baseURL = URL(string: urlString) else {
+            return nil
+        }
+        guard let playerId else {
+            return nil
+        }
+
+        guard var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false) else {
+            return nil
+        }
+        var queryItems = components.queryItems ?? []
+
+        // Apply extra params from cipher (except signature fields).
+        for (key, value) in params where key != "url" && key != "s" && key != "sp" {
+            setQueryItem(&queryItems, name: key, value: value)
+        }
+
+        if let s = params["s"] {
+            do {
+                let decoded = try await decodeParam(playerId: playerId, type: "sig", value: s)
+                let sp = params["sp"] ?? "signature"
+                setQueryItem(&queryItems, name: sp, value: decoded)
+            } catch {
+                return nil
+            }
+        }
+
+        components.queryItems = queryItems
+        guard let signedURL = components.url else { return nil }
+        return await decodeThrottlingIfNeeded(url: signedURL, playerId: playerId)
+    }
+
+    private func decodeThrottlingIfNeeded(url: URL, playerId: String?) async -> URL {
+        guard let playerId else { return url }
+        guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return url }
+        var queryItems = components.queryItems ?? []
+        guard let nValue = queryItems.first(where: { $0.name == "n" })?.value else {
+            return url
+        }
+        do {
+            let decoded = try await decodeParam(playerId: playerId, type: "n", value: nValue)
+            setQueryItem(&queryItems, name: "n", value: decoded)
+            components.queryItems = queryItems
+            return components.url ?? url
+        } catch {
+            return url
+        }
+    }
+
+    private func decodeParam(playerId: String, type: String, value: String) async throws -> String {
+        let cacheKey = "\(playerId):\(type):\(value)"
+        if let cached = decoderCache[cacheKey] {
+            return cached
+        }
+
+        guard var components = URLComponents(string: decoderBaseURL) else {
+            throw PlaybackError.decoderFailed
+        }
+        components.queryItems = [
+            URLQueryItem(name: "player", value: playerId),
+            URLQueryItem(name: type, value: value)
+        ]
+        guard let url = components.url else { throw PlaybackError.decoderFailed }
+
+        var request = URLRequest(url: url)
+        request.setValue(decoderUserAgent, forHTTPHeaderField: "User-Agent")
+
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
+            throw PlaybackError.decoderFailed
+        }
+        guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              (root["type"] as? String) == "result",
+              let responses = root["responses"] as? [[String: Any]],
+              let first = responses.first,
+              (first["type"] as? String) == "result",
+              let dataDict = first["data"] as? [String: Any],
+              let decoded = dataDict[value] as? String,
+              !decoded.isEmpty else {
+            throw PlaybackError.decoderFailed
+        }
+
+        decoderCache[cacheKey] = decoded
+        return decoded
+    }
+
+    private func parseQueryString(_ query: String) -> [String: String] {
+        var result: [String: String] = [:]
+        let pairs = query.split(separator: "&")
+        for pair in pairs {
+            let parts = pair.split(separator: "=", maxSplits: 1)
+            let key = parts.first.map(String.init) ?? ""
+            let value = parts.count > 1 ? String(parts[1]) : ""
+            let decodedKey = key.removingPercentEncoding ?? key
+            let decodedValue = value.removingPercentEncoding ?? value
+            result[decodedKey] = decodedValue
+        }
+        return result
+    }
+
+    private func setQueryItem(_ items: inout [URLQueryItem], name: String, value: String) {
+        if let index = items.firstIndex(where: { $0.name == name }) {
+            items[index].value = value
+        } else {
+            items.append(URLQueryItem(name: name, value: value))
+        }
     }
 
     private func streamHeaders(videoId: String, userAgent: String) -> [String: String] {

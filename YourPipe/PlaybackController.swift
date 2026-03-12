@@ -16,6 +16,7 @@ final class PlaybackController: NSObject, ObservableObject {
     @Published var channelAvatarURL: URL?
     @Published var channelId: String?
     @Published var thumbnailURL: URL?
+    @Published var descriptionText: String?
     @Published var currentVideoId: String?
     @Published var presentation: Presentation?
     @Published var isPlayingState: Bool = false
@@ -45,9 +46,11 @@ final class PlaybackController: NSObject, ObservableObject {
     private var tickTimer: Timer?
     private var playerLayer: AVPlayerLayer?
     private var pipController: AVPictureInPictureController?
+    private var hlsProxy: HLSProxy?
     private var isDeviceLocked = false
     private var artworkCache: [URL: MPMediaItemArtwork] = [:]
     private var currentArtwork: MPMediaItemArtwork?
+    private var currentPlayerId: String?
 
     override init() {
         super.init()
@@ -103,14 +106,18 @@ final class PlaybackController: NSObject, ObservableObject {
         channelAvatarURL = fallbackChannelAvatarURL
         thumbnailURL = fallbackThumbnailURL
         channelId = fallbackChannelId
+        descriptionText = nil
+        currentPlayerId = nil
 
         do {
             let playback = try await playbackService.resolve(videoId: videoId)
             title = playback.title ?? fallbackTitle
             channelName = playback.channelName ?? fallbackChannelName
             channelId = playback.channelId ?? fallbackChannelId
+            descriptionText = playback.description
+            currentPlayerId = playback.playerId
             await probeStream(url: playback.streamURL, headers: playback.headers)
-            let item = makePlayerItem(url: playback.streamURL, headers: playback.headers)
+            let item = makePlayerItem(url: playback.streamURL, headers: playback.headers, playerId: playback.playerId)
             observe(item: item)
             player?.pause()
             let newPlayer = AVPlayer(playerItem: item)
@@ -184,11 +191,14 @@ final class PlaybackController: NSObject, ObservableObject {
         isLoading = false
         presentation = nil
         isPlayingState = false
+        descriptionText = nil
+        currentPlayerId = nil
         currentArtwork = nil
         MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
         stopPictureInPictureIfNeeded()
         pipController = nil
         playerLayer = nil
+        hlsProxy = nil
     }
 
     func handleScenePhase(_ phase: ScenePhase) {
@@ -211,12 +221,31 @@ final class PlaybackController: NSObject, ObservableObject {
         configurePictureInPicture(for: layer)
     }
 
-    private func makePlayerItem(url: URL, headers: [String: String]) -> AVPlayerItem {
+    private func makePlayerItem(url: URL, headers: [String: String], playerId: String?) -> AVPlayerItem {
         let options: [String: Any] = [
             "AVURLAssetHTTPHeaderFieldsKey": headers
         ]
+        if isHLS(url: url) {
+            let proxy = HLSProxy(
+                originalURL: url,
+                headers: headers,
+                playerId: playerId,
+                decoder: playbackService
+            )
+            hlsProxy = proxy
+            let asset = AVURLAsset(url: proxy.proxiedURL, options: options)
+            asset.resourceLoader.setDelegate(proxy, queue: proxy.queue)
+            return AVPlayerItem(asset: asset)
+        }
+
+        hlsProxy = nil
         let asset = AVURLAsset(url: url, options: options)
         return AVPlayerItem(asset: asset)
+    }
+
+    private func isHLS(url: URL) -> Bool {
+        let lower = url.absoluteString.lowercased()
+        return lower.contains(".m3u8") || lower.contains("hls")
     }
 
     private func probeStream(url: URL, headers: [String: String]) async {

@@ -17,6 +17,7 @@
 		9FBA40B68FF6C9F9D7CD5F5B /* Preview Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 3C1578EB60712D3CF0553DFD /* Preview Assets.xcassets */; };
 		A3E3127385F838AACB115F90 /* YouTubePlaybackService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 46139578BAAAA6C1A99AB805 /* YouTubePlaybackService.swift */; };
 		AC07F894CDBA6F848D3DFF34 /* SearchViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3611262B456958F6B4DAE3F1 /* SearchViewModel.swift */; };
+		C5619DBBDBB5E12F00054E35 /* HLSProxy.swift in Sources */ = {isa = PBXBuildFile; fileRef = EC62CE928B7CD500DA8CF74D /* HLSProxy.swift */; };
 		C8AF736F8C29401355B52EA8 /* YouTubeSearchModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6270D5381961FFEB0ECA0147 /* YouTubeSearchModels.swift */; };
 		D54B9932B161DA6B14D83E24 /* YouTubeSearchService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5674F333091F43153657940E /* YouTubeSearchService.swift */; };
 		D9BA419A9729ED1319927F97 /* NewVideosViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 24FD54020159337F818EF103 /* NewVideosViewModel.swift */; };
@@ -37,6 +38,7 @@
 		BCBD0D7FCD7CA7B871237220 /* PlaybackController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlaybackController.swift; sourceTree = "<group>"; };
 		C3C82A9E0B6B60BBAB22FD2C /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
 		E19281EF564427E6F0DDEA7B /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
+		EC62CE928B7CD500DA8CF74D /* HLSProxy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HLSProxy.swift; sourceTree = "<group>"; };
 		F817A13A10F29661CE1CD04C /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
@@ -62,6 +64,7 @@
 			children = (
 				F817A13A10F29661CE1CD04C /* Assets.xcassets */,
 				C3C82A9E0B6B60BBAB22FD2C /* ContentView.swift */,
+				EC62CE928B7CD500DA8CF74D /* HLSProxy.swift */,
 				E19281EF564427E6F0DDEA7B /* Info.plist */,
 				24FD54020159337F818EF103 /* NewVideosViewModel.swift */,
 				BCBD0D7FCD7CA7B871237220 /* PlaybackController.swift */,
@@ -157,6 +160,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				60FCA8C89CBEB18FD42E1627 /* ContentView.swift in Sources */,
+				C5619DBBDBB5E12F00054E35 /* HLSProxy.swift in Sources */,
 				D9BA419A9729ED1319927F97 /* NewVideosViewModel.swift in Sources */,
 				70136AAE16253F817E1D045E /* PlaybackController.swift in Sources */,
 				02A4CF3B6309F43FBE2E65FA /* PlayerSurfaceView.swift in Sources */,

@@ -24,7 +24,9 @@ actor YouTubePlaybackService {
         let title: String?
         let channelName: String?
         let channelId: String?
+        let description: String?
         let headers: [String: String]
+        let playerId: String?
     }
 
     enum PlaybackError: LocalizedError {
@@ -125,6 +127,7 @@ actor YouTubePlaybackService {
         let title = videoDetails?["title"] as? String
         let channelName = videoDetails?["author"] as? String
         let channelId = videoDetails?["channelId"] as? String
+        let description = videoDetails?["shortDescription"] as? String
         let isLiveContent = videoDetails?["isLiveContent"] as? Bool ?? false
         let playerId = await resolvePlayerId(videoId: videoId, root: root)
 #if DEBUG
@@ -144,7 +147,9 @@ actor YouTubePlaybackService {
                     title: title,
                     channelName: channelName,
                     channelId: channelId,
-                    headers: streamHeaders(videoId: videoId, userAgent: iosUserAgent(countryCode: "US"))
+                    description: description,
+                    headers: streamHeaders(videoId: videoId, userAgent: iosUserAgent(countryCode: "US")),
+                    playerId: playerId
                 )
             }
             if let hlsURLString, let url = URL(string: hlsURLString) {
@@ -157,7 +162,9 @@ actor YouTubePlaybackService {
                     title: title,
                     channelName: channelName,
                     channelId: channelId,
-                    headers: streamHeaders(videoId: videoId, userAgent: iosUserAgent(countryCode: "US"))
+                    description: description,
+                    headers: streamHeaders(videoId: videoId, userAgent: iosUserAgent(countryCode: "US")),
+                    playerId: playerId
                 )
             }
         } else if let hlsURLString, let url = URL(string: hlsURLString) {
@@ -170,7 +177,9 @@ actor YouTubePlaybackService {
                 title: title,
                 channelName: channelName,
                 channelId: channelId,
-                headers: streamHeaders(videoId: videoId, userAgent: iosUserAgent(countryCode: "US"))
+                description: description,
+                headers: streamHeaders(videoId: videoId, userAgent: iosUserAgent(countryCode: "US")),
+                playerId: playerId
             )
         }
 
@@ -206,6 +215,7 @@ actor YouTubePlaybackService {
         let title = videoDetails?["title"] as? String
         let channelName = videoDetails?["author"] as? String
         let channelId = videoDetails?["channelId"] as? String
+        let description = videoDetails?["shortDescription"] as? String
         let isLiveContent = videoDetails?["isLiveContent"] as? Bool ?? false
         let playerId = await resolvePlayerId(videoId: videoId, root: root)
 #if DEBUG
@@ -224,7 +234,9 @@ actor YouTubePlaybackService {
                     title: title,
                     channelName: channelName,
                     channelId: channelId,
-                    headers: streamHeaders(videoId: videoId, userAgent: webUserAgent)
+                    description: description,
+                    headers: streamHeaders(videoId: videoId, userAgent: webUserAgent),
+                    playerId: playerId
                 )
             }
         }
@@ -238,7 +250,9 @@ actor YouTubePlaybackService {
                 title: title,
                 channelName: channelName,
                 channelId: channelId,
-                headers: streamHeaders(videoId: videoId, userAgent: webUserAgent)
+                description: description,
+                headers: streamHeaders(videoId: videoId, userAgent: webUserAgent),
+                playerId: playerId
             )
         }
 
@@ -417,6 +431,10 @@ actor YouTubePlaybackService {
         } catch {
             return url
         }
+    }
+
+    func decodeThrottlingURL(_ url: URL, playerId: String?) async -> URL {
+        await decodeThrottlingIfNeeded(url: url, playerId: playerId)
     }
 
     private func decodeParam(playerId: String, type: String, value: String) async throws -> String {

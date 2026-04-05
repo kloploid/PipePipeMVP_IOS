@@ -99,10 +99,18 @@ private struct MiniPlayerBar: View {
                         Text(playback.title ?? "Без названия")
                             .font(.subheadline.weight(.semibold))
                             .lineLimit(1)
-                        Text(playback.channelName ?? "Канал")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
+                        HStack(spacing: 6) {
+                            Text(playback.channelName ?? "Канал")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                            if let source = playback.activeSourceLabel {
+                                Text(source)
+                                    .font(.caption2)
+                                    .foregroundStyle(.orange)
+                                    .lineLimit(1)
+                            }
+                        }
                     }
                 }
                 .buttonStyle(.plain)
@@ -491,20 +499,27 @@ private struct FeedVideoRow: View {
 }
 
 private struct SettingsView: View {
-    @State private var autoplayEnabled: Bool = true
-    @State private var highQualityOnlyOnWiFi: Bool = true
+    @EnvironmentObject private var settings: AppSettingsStore
 
     var body: some View {
         NavigationStack {
             Form {
                 Section("Плеер") {
-                    Toggle("Автовоспроизведение", isOn: $autoplayEnabled)
-                    Toggle("Высокое качество только по Wi-Fi", isOn: $highQualityOnlyOnWiFi)
+                    Picker("Источник видео", selection: $settings.playbackSourceMode) {
+                        ForEach(PlaybackSourceMode.allCases) { mode in
+                            Text(mode.title).tag(mode)
+                        }
+                    }
+                    .pickerStyle(.menu)
+
+                    Text("Режим «Авто» сначала пробует прямой YouTube, затем fallback через Piped.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
                 }
 
                 Section("О приложении") {
-                    LabeledContent("Версия", value: "0.1 MVP")
-                    LabeledContent("Телеметрия", value: "Отключена")
+                    LabeledContent("Версия", value: "0.2 Playback Rewrite")
+                    LabeledContent("Источник по умолчанию", value: PlaybackSourceMode.direct.title)
                 }
             }
             .navigationTitle("Настройки")
@@ -516,6 +531,7 @@ private struct SettingsView: View {
     ContentView()
         .environmentObject(PlaybackController())
         .environmentObject(SubscriptionStore())
+        .environmentObject(AppSettingsStore())
 }
 
 #Preview("New Videos") {
@@ -530,8 +546,10 @@ private struct SettingsView: View {
     SearchView()
         .environmentObject(PlaybackController())
         .environmentObject(SubscriptionStore())
+        .environmentObject(AppSettingsStore())
 }
 
 #Preview("Settings") {
     SettingsView()
+        .environmentObject(AppSettingsStore())
 }

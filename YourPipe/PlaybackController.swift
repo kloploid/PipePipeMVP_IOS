@@ -20,6 +20,7 @@ final class PlaybackController: NSObject, ObservableObject {
     @Published var currentVideoId: String?
     @Published var presentation: Presentation?
     @Published var isPlayingState: Bool = false
+    @Published var activeSourceLabel: String?
 
     struct Presentation: Identifiable {
         let id: String
@@ -41,6 +42,8 @@ final class PlaybackController: NSObject, ObservableObject {
     }
 
     private let playbackService = YouTubePlaybackService.shared
+    private let resolver: PlaybackResolver
+    private let settings: AppSettingsStore
     private var playerStatusObservation: NSKeyValueObservation?
     private var remoteCommandsConfigured = false
     private var tickTimer: Timer?
@@ -51,8 +54,16 @@ final class PlaybackController: NSObject, ObservableObject {
     private var artworkCache: [URL: MPMediaItemArtwork] = [:]
     private var currentArtwork: MPMediaItemArtwork?
     private var currentPlayerId: String?
+    private var attemptedPipedRecoveryForVideoId: String?
+    private var isRecoveringViaPiped = false
+    private let pipedAutoFallbackEnabled = false
 
-    override init() {
+    init(
+        resolver: PlaybackResolver = .shared,
+        settings: AppSettingsStore = .shared
+    ) {
+        self.resolver = resolver
+        self.settings = settings
         super.init()
         configureAudioSession()
         configureRemoteCommands()
@@ -108,15 +119,24 @@ final class PlaybackController: NSObject, ObservableObject {
         channelId = fallbackChannelId
         descriptionText = nil
         currentPlayerId = nil
+        activeSourceLabel = nil
+        attemptedPipedRecoveryForVideoId = nil
+        isRecoveringViaPiped = false
 
         do {
-            let playback = try await playbackService.resolve(videoId: videoId)
+            let playback = try await resolver.resolve(
+                videoId: videoId,
+                mode: settings.playbackSourceMode
+            )
             title = playback.title ?? fallbackTitle
             channelName = playback.channelName ?? fallbackChannelName
             channelId = playback.channelId ?? fallbackChannelId
             descriptionText = playback.description
             currentPlayerId = playback.playerId
-            await probeStream(url: playback.streamURL, headers: playback.headers)
+            activeSourceLabel = playback.sourceLabel
+            Task {
+                await self.probeStream(url: playback.streamURL, headers: playback.headers)
+            }
             let item = makePlayerItem(url: playback.streamURL, headers: playback.headers, playerId: playback.playerId)
             observe(item: item)
             player?.pause()
@@ -130,6 +150,7 @@ final class PlaybackController: NSObject, ObservableObject {
         } catch {
             errorMessage = error.localizedDescription
             isPlayingState = false
+            activeSourceLabel = nil
         }
 
         isLoading = false
@@ -154,6 +175,10 @@ final class PlaybackController: NSObject, ObservableObject {
             thumbnailURL: thumbnailURL,
             channelId: channelId
         )
+
+        Task {
+            await resolver.prefetch(videoId: videoId, mode: settings.playbackSourceMode)
+        }
     }
 
     func presentCurrent() {
@@ -194,6 +219,9 @@ final class PlaybackController: NSObject, ObservableObject {
         descriptionText = nil
         currentPlayerId = nil
         currentArtwork = nil
+        activeSourceLabel = nil
+        attemptedPipedRecoveryForVideoId = nil
+        isRecoveringViaPiped = false
         MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
         stopPictureInPictureIfNeeded()
         pipController = nil
@@ -223,9 +251,15 @@ final class PlaybackController: NSObject, ObservableObject {
 
     private func makePlayerItem(url: URL, headers: [String: String], playerId: String?) -> AVPlayerItem {
         let options: [String: Any] = [
-            "AVURLAssetHTTPHeaderFieldsKey": headers
+            "AVURLAssetHTTPHeaderFieldsKey": headersForAsset(url: url, headers: headers)
         ]
         if isHLS(url: url) {
+            if shouldBypassHLSProxy(url: url) {
+                hlsProxy = nil
+                let asset = AVURLAsset(url: url, options: options)
+                return AVPlayerItem(asset: asset)
+            }
+
             let proxy = HLSProxy(
                 originalURL: url,
                 headers: headers,
@@ -248,11 +282,26 @@ final class PlaybackController: NSObject, ObservableObject {
         return lower.contains(".m3u8") || lower.contains("hls")
     }
 
+    private func shouldBypassHLSProxy(url: URL) -> Bool {
+        guard let host = url.host?.lowercased() else { return false }
+        return host == "manifest.googlevideo.com" || host.hasSuffix(".googlevideo.com")
+    }
+
+    private func headersForAsset(url: URL, headers: [String: String]) -> [String: String] {
+        guard let host = url.host?.lowercased() else { return headers }
+        if host == "manifest.googlevideo.com" || host.hasSuffix(".googlevideo.com") {
+            // Signed Googlevideo URLs should be requested without custom headers.
+            return [:]
+        }
+        return headers
+    }
+
     private func probeStream(url: URL, headers: [String: String]) async {
 #if DEBUG
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
-        headers.forEach { key, value in
+        let effectiveHeaders = headersForAsset(url: url, headers: headers)
+        effectiveHeaders.forEach { key, value in
             request.setValue(value, forHTTPHeaderField: key)
         }
         request.setValue("bytes=0-1023", forHTTPHeaderField: "Range")
@@ -285,9 +334,87 @@ final class PlaybackController: NSObject, ObservableObject {
                 Task { @MainActor in
                     self.errorMessage = "Поток AVPlayer недоступен (\(domain):\(code)) \(reason)"
                     print("[VideoPlayback] AVPlayer failed domain=\(domain) code=\(code) reason=\(reason) underlying=\(underlyingDesc)")
+                    await self.recoverViaPipedIfNeeded(triggerError: nsError, underlying: underlying)
                 }
             }
         }
+    }
+
+    private func recoverViaPipedIfNeeded(triggerError: NSError?, underlying: NSError?) async {
+        guard pipedAutoFallbackEnabled else { return }
+        guard settings.playbackSourceMode == .auto else { return }
+        guard !isRecoveringViaPiped else { return }
+        guard activeSourceLabel != "Piped" else { return }
+        guard let videoId = currentVideoId else { return }
+        guard attemptedPipedRecoveryForVideoId != videoId else { return }
+        guard shouldRetryWithPiped(triggerError: triggerError, underlying: underlying) else { return }
+
+        attemptedPipedRecoveryForVideoId = videoId
+        isRecoveringViaPiped = true
+        isLoading = true
+
+        do {
+            let playback = try await resolver.resolve(videoId: videoId, mode: .piped)
+            title = playback.title ?? title
+            channelName = playback.channelName ?? channelName
+            channelId = playback.channelId ?? channelId
+            descriptionText = playback.description ?? descriptionText
+            currentPlayerId = playback.playerId
+            activeSourceLabel = playback.sourceLabel
+            Task {
+                await self.probeStream(url: playback.streamURL, headers: playback.headers)
+            }
+            let item = makePlayerItem(url: playback.streamURL, headers: playback.headers, playerId: playback.playerId)
+            observe(item: item)
+            player?.pause()
+            let newPlayer = AVPlayer(playerItem: item)
+            player = newPlayer
+            ensureAudioSessionActive()
+            newPlayer.play()
+            isPlayingState = true
+            errorMessage = nil
+            updateNowPlayingInfo()
+            await loadArtworkIfNeeded()
+            print("[VideoPlayback] recovered via Piped fallback")
+        } catch {
+            let previous = errorMessage ?? "Поток AVPlayer недоступен."
+            errorMessage = "\(previous)\nFallback Piped: \(error.localizedDescription)"
+            isPlayingState = false
+            print("[VideoPlayback] Piped fallback failed: \(error.localizedDescription)")
+        }
+
+        isLoading = false
+        isRecoveringViaPiped = false
+    }
+
+    private func shouldRetryWithPiped(triggerError: NSError?, underlying: NSError?) -> Bool {
+        if let triggerError {
+            if triggerError.domain == NSURLErrorDomain && triggerError.code == -1102 {
+                return true
+            }
+            if triggerError.domain == "CoreMediaErrorDomain" && triggerError.code == -12660 {
+                return true
+            }
+            let text = "\(triggerError.localizedDescription) \(triggerError.localizedFailureReason ?? "")".lowercased()
+            if text.contains("403") || text.contains("forbidden") || text.contains("permission") {
+                return true
+            }
+        }
+
+        if let underlying {
+            if underlying.domain == NSURLErrorDomain && underlying.code == -1102 {
+                return true
+            }
+            if underlying.domain == "CoreMediaErrorDomain" && underlying.code == -12660 {
+                return true
+            }
+            let text = "\(underlying.localizedDescription) \(underlying.localizedFailureReason ?? "")".lowercased()
+            if text.contains("403") || text.contains("forbidden") || text.contains("permission") {
+                return true
+            }
+        }
+
+        return false
     }
 
     private func ensureAudioSessionActive() {

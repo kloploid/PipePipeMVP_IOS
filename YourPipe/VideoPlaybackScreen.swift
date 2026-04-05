@@ -46,6 +46,7 @@ struct VideoPlaybackScreen: View {
                             metaLine: playback.metaLine ?? initialMetaLine,
                             channelName: playback.channelName ?? initialChannelName,
                             channelAvatarURL: playback.channelAvatarURL ?? initialChannelAvatarURL,
+                            sourceLabel: playback.activeSourceLabel,
                             channelId: playback.channelId ?? initialChannelId,
                             isSubscribed: { channelId in
                                 subscriptions.isSubscribed(channelId)
@@ -237,6 +238,7 @@ private struct VideoHeaderView: View {
     let metaLine: String?
     let channelName: String?
     let channelAvatarURL: URL?
+    let sourceLabel: String?
     let channelId: String?
     let isSubscribed: (String) -> Bool
     let toggleSubscription: (String) -> Void
@@ -252,6 +254,12 @@ private struct VideoHeaderView: View {
                 Text(meta)
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
+            }
+
+            if let sourceLabel, !sourceLabel.isEmpty {
+                Text("Источник: \(sourceLabel)")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
             }
 
             HStack(spacing: 12) {

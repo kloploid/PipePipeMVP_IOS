@@ -118,7 +118,7 @@ actor YouTubePlaybackService {
 
         Task {
             let fetched = await self.fetchVisitorData()
-            await self.finishVisitorDataFetch(fetched)
+            self.finishVisitorDataFetch(fetched)
         }
     }
 
@@ -219,9 +219,7 @@ actor YouTubePlaybackService {
         let desc      = details?["shortDescription"] as? String
 
         let streaming = root["streamingData"] as? [String: Any]
-        let playerId: String?
-        if let pid = extractPlayerId(from: root) { playerId = pid }
-        else { playerId = await fetchPlayerIdFromWatchPage(videoId: videoId) }
+        let playerId: String? = extractPlayerId(from: root)
         let headers   = iosStreamHeaders(videoId: videoId)
 
 
@@ -305,9 +303,7 @@ actor YouTubePlaybackService {
         let isLive    = details?["isLiveContent"] as? Bool ?? false
 
         let streaming = root["streamingData"] as? [String: Any]
-        let playerId: String?
-        if let pid = extractPlayerId(from: root) { playerId = pid }
-        else { playerId = await fetchPlayerIdFromWatchPage(videoId: videoId) }
+        let playerId: String? = extractPlayerId(from: root)
         let headers   = androidStreamHeaders(videoId: videoId, userAgent: vrUserAgent)
 
         // Muxed MP4 first — direct URL, no HLS proxy, far less 403-prone
@@ -382,9 +378,7 @@ actor YouTubePlaybackService {
         let isLive    = details?["isLiveContent"] as? Bool ?? false
 
         let streaming = root["streamingData"] as? [String: Any]
-        let playerId: String?
-        if let pid = extractPlayerId(from: root) { playerId = pid }
-        else { playerId = await fetchPlayerIdFromWatchPage(videoId: videoId) }
+        let playerId: String? = extractPlayerId(from: root)
         let headers   = androidStreamHeaders(videoId: videoId, userAgent: androidUserAgent)
 
         // Muxed MP4 first — direct URL, no HLS proxy, far less 403-prone

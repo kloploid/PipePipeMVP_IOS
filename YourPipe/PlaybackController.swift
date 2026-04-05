@@ -73,21 +73,27 @@ final class PlaybackController: NSObject, ObservableObject {
             object: nil,
             queue: .main
         ) { [weak self] notification in
-            self?.handleAudioSessionInterruption(notification)
+            Task { @MainActor [weak self] in
+                self?.handleAudioSessionInterruption(notification)
+            }
         }
         NotificationCenter.default.addObserver(
             forName: UIApplication.protectedDataWillBecomeUnavailableNotification,
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            self?.handleDeviceLock()
+            Task { @MainActor [weak self] in
+                self?.handleDeviceLock()
+            }
         }
         NotificationCenter.default.addObserver(
             forName: UIApplication.protectedDataDidBecomeAvailableNotification,
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            self?.isDeviceLocked = false
+            Task { @MainActor [weak self] in
+                self?.isDeviceLocked = false
+            }
         }
     }
 
@@ -141,9 +147,10 @@ final class PlaybackController: NSObject, ObservableObject {
             observe(item: item)
             player?.pause()
             let newPlayer = AVPlayer(playerItem: item)
+            newPlayer.automaticallyWaitsToMinimizeStalling = false
             player = newPlayer
             ensureAudioSessionActive()
-            newPlayer.play()
+            newPlayer.playImmediately(atRate: 1.0)
             isPlayingState = true
             updateNowPlayingInfo()
             await loadArtworkIfNeeded()
@@ -257,7 +264,9 @@ final class PlaybackController: NSObject, ObservableObject {
             if shouldBypassHLSProxy(url: url) {
                 hlsProxy = nil
                 let asset = AVURLAsset(url: url, options: options)
-                return AVPlayerItem(asset: asset)
+                let item = AVPlayerItem(asset: asset)
+                configureForFastStart(item)
+                return item
             }
 
             let proxy = HLSProxy(
@@ -269,12 +278,21 @@ final class PlaybackController: NSObject, ObservableObject {
             hlsProxy = proxy
             let asset = AVURLAsset(url: proxy.proxiedURL, options: options)
             asset.resourceLoader.setDelegate(proxy, queue: proxy.queue)
-            return AVPlayerItem(asset: asset)
+            let item = AVPlayerItem(asset: asset)
+            configureForFastStart(item)
+            return item
         }
 
         hlsProxy = nil
         let asset = AVURLAsset(url: url, options: options)
-        return AVPlayerItem(asset: asset)
+        let item = AVPlayerItem(asset: asset)
+        configureForFastStart(item)
+        return item
+    }
+
+    private func configureForFastStart(_ item: AVPlayerItem) {
+        item.preferredForwardBufferDuration = 0
+        item.canUseNetworkResourcesForLiveStreamingWhilePaused = true
     }
 
     private func isHLS(url: URL) -> Bool {
@@ -368,9 +386,10 @@ final class PlaybackController: NSObject, ObservableObject {
             observe(item: item)
             player?.pause()
             let newPlayer = AVPlayer(playerItem: item)
+            newPlayer.automaticallyWaitsToMinimizeStalling = false
             player = newPlayer
             ensureAudioSessionActive()
-            newPlayer.play()
+            newPlayer.playImmediately(atRate: 1.0)
             isPlayingState = true
             errorMessage = nil
             updateNowPlayingInfo()
@@ -500,13 +519,15 @@ final class PlaybackController: NSObject, ObservableObject {
     private func startTickTimer() {
         tickTimer?.invalidate()
         tickTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
-            guard let self else { return }
-            if let player = self.player {
-                self.isPlayingState = (player.timeControlStatus == .playing)
-            } else {
-                self.isPlayingState = false
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                if let player = self.player {
+                    self.isPlayingState = (player.timeControlStatus == .playing)
+                } else {
+                    self.isPlayingState = false
+                }
+                self.updateNowPlayingInfo()
             }
-            self.updateNowPlayingInfo()
         }
         RunLoop.main.add(tickTimer!, forMode: .common)
     }

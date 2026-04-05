@@ -21,6 +21,9 @@ struct YourPipeApp: App {
         }
 #endif
         UIApplication.shared.beginReceivingRemoteControlEvents()
+        Task {
+            await YouTubePlaybackService.shared.warmup()
+        }
     }
 
     var body: some Scene {

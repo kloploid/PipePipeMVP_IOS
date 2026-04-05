@@ -57,6 +57,14 @@ final class PlaybackController: NSObject, ObservableObject {
     private var attemptedPipedRecoveryForVideoId: String?
     private var isRecoveringViaPiped = false
     private let pipedAutoFallbackEnabled = false
+    private var startupMetrics: StartupMetrics?
+    private var firstFrameObserverToken: Any?
+    private var readyWatchdogTask: Task<Void, Never>?
+    private var startupRetryAttemptedForVideoId: String?
+    private var startupStreamSignature: String?
+    private let startupReadyTimeoutSeconds: UInt64 = 3
+    private let startupInitialPeakBitRate: Double = 700_000
+    private let enableStartupProbeLogs = false
 
     init(
         resolver: PlaybackResolver = .shared,
@@ -110,6 +118,9 @@ final class PlaybackController: NSObject, ObservableObject {
         fallbackThumbnailURL: URL?,
         fallbackChannelId: String?
     ) async {
+        if currentVideoId == videoId, isLoading {
+            return
+        }
         if currentVideoId == videoId, player != nil, errorMessage == nil {
             return
         }
@@ -128,39 +139,53 @@ final class PlaybackController: NSObject, ObservableObject {
         activeSourceLabel = nil
         attemptedPipedRecoveryForVideoId = nil
         isRecoveringViaPiped = false
+        startupRetryAttemptedForVideoId = nil
+        startupStreamSignature = nil
+        startupMetrics = StartupMetrics(videoId: videoId)
+        cancelReadyWatchdog()
 
         do {
             let playback = try await resolver.resolve(
                 videoId: videoId,
                 mode: settings.playbackSourceMode
             )
+            startupMetrics?.resolveCompleted()
             title = playback.title ?? fallbackTitle
             channelName = playback.channelName ?? fallbackChannelName
             channelId = playback.channelId ?? fallbackChannelId
             descriptionText = playback.description
             currentPlayerId = playback.playerId
             activeSourceLabel = playback.sourceLabel
+            startupStreamSignature = streamSignature(for: playback.streamURL)
             Task {
                 await self.probeStream(url: playback.streamURL, headers: playback.headers)
             }
             let item = makePlayerItem(url: playback.streamURL, headers: playback.headers, playerId: playback.playerId)
             observe(item: item)
             player?.pause()
+            removeFirstFrameObserverIfNeeded()
             let newPlayer = AVPlayer(playerItem: item)
             newPlayer.automaticallyWaitsToMinimizeStalling = false
             player = newPlayer
+            attachFirstFrameObserver(player: newPlayer, videoId: videoId)
             ensureAudioSessionActive()
             newPlayer.playImmediately(atRate: 1.0)
             isPlayingState = true
             updateNowPlayingInfo()
-            await loadArtworkIfNeeded()
+            Task {
+                await self.loadArtworkIfNeeded()
+            }
+            startReadyWatchdog(videoId: videoId, excludingDirectClient: playback.directClientLabel)
+            isLoading = false
+            return
         } catch {
             errorMessage = error.localizedDescription
             isPlayingState = false
             activeSourceLabel = nil
+            isLoading = false
+            cancelReadyWatchdog()
+            return
         }
-
-        isLoading = false
     }
 
     func present(
@@ -185,6 +210,17 @@ final class PlaybackController: NSObject, ObservableObject {
 
         Task {
             await resolver.prefetch(videoId: videoId, mode: settings.playbackSourceMode)
+        }
+        Task {
+            await self.play(
+                videoId: videoId,
+                fallbackTitle: title,
+                fallbackMetaLine: metaLine,
+                fallbackChannelName: channelName,
+                fallbackChannelAvatarURL: channelAvatarURL,
+                fallbackThumbnailURL: thumbnailURL,
+                fallbackChannelId: channelId
+            )
         }
     }
 
@@ -217,6 +253,8 @@ final class PlaybackController: NSObject, ObservableObject {
 
     func stop() {
         player?.pause()
+        cancelReadyWatchdog()
+        removeFirstFrameObserverIfNeeded()
         player = nil
         playerStatusObservation = nil
         currentVideoId = nil
@@ -229,6 +267,9 @@ final class PlaybackController: NSObject, ObservableObject {
         activeSourceLabel = nil
         attemptedPipedRecoveryForVideoId = nil
         isRecoveringViaPiped = false
+        startupMetrics = nil
+        startupRetryAttemptedForVideoId = nil
+        startupStreamSignature = nil
         MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
         stopPictureInPictureIfNeeded()
         pipController = nil
@@ -257,14 +298,20 @@ final class PlaybackController: NSObject, ObservableObject {
     }
 
     private func makePlayerItem(url: URL, headers: [String: String], playerId: String?) -> AVPlayerItem {
-        let options: [String: Any] = [
-            "AVURLAssetHTTPHeaderFieldsKey": headersForAsset(url: url, headers: headers)
-        ]
+        let effectiveHeaders = headersForAsset(url: url, headers: headers)
+        let options: [String: Any]? = effectiveHeaders.isEmpty
+            ? nil
+            : ["AVURLAssetHTTPHeaderFieldsKey": effectiveHeaders]
         if isHLS(url: url) {
             if shouldBypassHLSProxy(url: url) {
                 hlsProxy = nil
-                let asset = AVURLAsset(url: url, options: options)
-                let item = AVPlayerItem(asset: asset)
+                let item: AVPlayerItem
+                if options == nil {
+                    item = AVPlayerItem(url: url)
+                } else {
+                    let asset = AVURLAsset(url: url, options: options)
+                    item = AVPlayerItem(asset: asset)
+                }
                 configureForFastStart(item)
                 return item
             }
@@ -284,14 +331,20 @@ final class PlaybackController: NSObject, ObservableObject {
         }
 
         hlsProxy = nil
-        let asset = AVURLAsset(url: url, options: options)
-        let item = AVPlayerItem(asset: asset)
+        let item: AVPlayerItem
+        if options == nil {
+            item = AVPlayerItem(url: url)
+        } else {
+            let asset = AVURLAsset(url: url, options: options)
+            item = AVPlayerItem(asset: asset)
+        }
         configureForFastStart(item)
         return item
     }
 
     private func configureForFastStart(_ item: AVPlayerItem) {
         item.preferredForwardBufferDuration = 0
+        item.preferredPeakBitRate = startupInitialPeakBitRate
         item.canUseNetworkResourcesForLiveStreamingWhilePaused = true
     }
 
@@ -316,6 +369,7 @@ final class PlaybackController: NSObject, ObservableObject {
 
     private func probeStream(url: URL, headers: [String: String]) async {
 #if DEBUG
+        guard enableStartupProbeLogs else { return }
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
         let effectiveHeaders = headersForAsset(url: url, headers: headers)
@@ -342,6 +396,12 @@ final class PlaybackController: NSObject, ObservableObject {
     private func observe(item: AVPlayerItem) {
         playerStatusObservation = item.observe(\.status, options: [.new, .initial]) { [weak self] playerItem, _ in
             guard let self else { return }
+            if playerItem.status == .readyToPlay {
+                Task { @MainActor in
+                    self.cancelReadyWatchdog()
+                    self.startupMetrics?.readyToPlay()
+                }
+            }
             if playerItem.status == .failed {
                 let nsError = playerItem.error as NSError?
                 let code = nsError?.code ?? -1
@@ -356,6 +416,29 @@ final class PlaybackController: NSObject, ObservableObject {
                 }
             }
         }
+    }
+
+    private func attachFirstFrameObserver(player: AVPlayer, videoId: String) {
+        removeFirstFrameObserverIfNeeded()
+        firstFrameObserverToken = player.addPeriodicTimeObserver(
+            forInterval: CMTime(seconds: 0.05, preferredTimescale: 600),
+            queue: .main
+        ) { [weak self] time in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                guard time.seconds > 0 else { return }
+                guard self.currentVideoId == videoId else { return }
+                player.currentItem?.preferredPeakBitRate = 0
+                self.startupMetrics?.firstFrame()
+                self.removeFirstFrameObserverIfNeeded()
+            }
+        }
+    }
+
+    private func removeFirstFrameObserverIfNeeded() {
+        guard let token = firstFrameObserverToken else { return }
+        player?.removeTimeObserver(token)
+        firstFrameObserverToken = nil
     }
 
     private func recoverViaPipedIfNeeded(triggerError: NSError?, underlying: NSError?) async {
@@ -385,15 +468,20 @@ final class PlaybackController: NSObject, ObservableObject {
             let item = makePlayerItem(url: playback.streamURL, headers: playback.headers, playerId: playback.playerId)
             observe(item: item)
             player?.pause()
+            removeFirstFrameObserverIfNeeded()
             let newPlayer = AVPlayer(playerItem: item)
             newPlayer.automaticallyWaitsToMinimizeStalling = false
             player = newPlayer
+            attachFirstFrameObserver(player: newPlayer, videoId: videoId)
             ensureAudioSessionActive()
             newPlayer.playImmediately(atRate: 1.0)
             isPlayingState = true
             errorMessage = nil
             updateNowPlayingInfo()
-            await loadArtworkIfNeeded()
+            Task {
+                await self.loadArtworkIfNeeded()
+            }
+            cancelReadyWatchdog()
             print("[VideoPlayback] recovered via Piped fallback")
         } catch {
             let previous = errorMessage ?? "Поток AVPlayer недоступен."
@@ -434,6 +522,107 @@ final class PlaybackController: NSObject, ObservableObject {
         }
 
         return false
+    }
+
+    private func startReadyWatchdog(videoId: String, excludingDirectClient: String?) {
+        cancelReadyWatchdog()
+        guard settings.playbackSourceMode != .piped else { return }
+        guard let excludingDirectClient, !excludingDirectClient.isEmpty else { return }
+
+        readyWatchdogTask = Task { [weak self] in
+            guard let self else { return }
+            try? await Task.sleep(nanoseconds: self.startupReadyTimeoutSeconds * 1_000_000_000)
+            await self.performStartupRetryIfNeeded(videoId: videoId, excludingDirectClient: excludingDirectClient)
+        }
+    }
+
+    private func cancelReadyWatchdog() {
+        readyWatchdogTask?.cancel()
+        readyWatchdogTask = nil
+    }
+
+    private func performStartupRetryIfNeeded(videoId: String, excludingDirectClient: String) async {
+        guard currentVideoId == videoId else { return }
+        guard startupRetryAttemptedForVideoId != videoId else { return }
+        guard player?.currentItem?.status != .readyToPlay else { return }
+        guard shouldRetryStartupNow() else { return }
+        guard !Task.isCancelled else { return }
+
+        startupRetryAttemptedForVideoId = videoId
+        isLoading = true
+#if DEBUG
+        print("[Startup] video=\(videoId) retrying startup via alternate client, excluding=\(excludingDirectClient)")
+#endif
+        do {
+            let playback = try await resolver.resolve(
+                videoId: videoId,
+                mode: .direct,
+                forceRefresh: true,
+                excludingDirectClient: excludingDirectClient
+            )
+            title = playback.title ?? title
+            channelName = playback.channelName ?? channelName
+            channelId = playback.channelId ?? channelId
+            descriptionText = playback.description ?? descriptionText
+            currentPlayerId = playback.playerId
+            activeSourceLabel = playback.sourceLabel
+            let newSignature = streamSignature(for: playback.streamURL)
+            if newSignature == startupStreamSignature {
+#if DEBUG
+                print("[Startup] video=\(videoId) retry skipped: same stream signature")
+#endif
+                isLoading = false
+                return
+            }
+            startupStreamSignature = newSignature
+            Task {
+                await self.probeStream(url: playback.streamURL, headers: playback.headers)
+            }
+            let item = makePlayerItem(url: playback.streamURL, headers: playback.headers, playerId: playback.playerId)
+            observe(item: item)
+            player?.pause()
+            removeFirstFrameObserverIfNeeded()
+            let newPlayer = AVPlayer(playerItem: item)
+            newPlayer.automaticallyWaitsToMinimizeStalling = false
+            player = newPlayer
+            attachFirstFrameObserver(player: newPlayer, videoId: videoId)
+            ensureAudioSessionActive()
+            newPlayer.playImmediately(atRate: 1.0)
+            isPlayingState = true
+            errorMessage = nil
+            updateNowPlayingInfo()
+            Task {
+                await self.loadArtworkIfNeeded()
+            }
+            startReadyWatchdog(videoId: videoId, excludingDirectClient: playback.directClientLabel)
+        } catch {
+#if DEBUG
+            print("[Startup] video=\(videoId) retry failed: \(error.localizedDescription)")
+#endif
+        }
+
+        isLoading = false
+    }
+
+    private func shouldRetryStartupNow() -> Bool {
+        guard let item = player?.currentItem else { return true }
+        if item.status == .readyToPlay || item.isPlaybackLikelyToKeepUp {
+            return false
+        }
+        guard let range = item.loadedTimeRanges.first?.timeRangeValue else {
+            return true
+        }
+        let bufferedSeconds = CMTimeGetSeconds(range.start) + CMTimeGetSeconds(range.duration)
+        return bufferedSeconds < 0.8
+    }
+
+    private func streamSignature(for url: URL) -> String {
+        let host = url.host?.lowercased() ?? ""
+        let path = url.path
+        let components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+        let id = components?.queryItems?.first(where: { $0.name == "id" })?.value ?? ""
+        let itag = components?.queryItems?.first(where: { $0.name == "itag" })?.value ?? ""
+        return "\(host)|\(path)|\(id)|\(itag)"
     }
 
     private func ensureAudioSessionActive() {
@@ -603,3 +792,33 @@ final class PlaybackController: NSObject, ObservableObject {
 }
 
 extension PlaybackController: AVPictureInPictureControllerDelegate {}
+
+private struct StartupMetrics {
+    let videoId: String
+    private let startedAt = Date()
+    private(set) var didLogResolve = false
+    private(set) var didLogReady = false
+    private(set) var didLogFirstFrame = false
+
+    private func elapsedMs() -> Int {
+        Int(Date().timeIntervalSince(startedAt) * 1000)
+    }
+
+    mutating func resolveCompleted() {
+        guard !didLogResolve else { return }
+        didLogResolve = true
+        print("[Startup] video=\(videoId) resolve_ms=\(elapsedMs())")
+    }
+
+    mutating func readyToPlay() {
+        guard !didLogReady else { return }
+        didLogReady = true
+        print("[Startup] video=\(videoId) ready_ms=\(elapsedMs())")
+    }
+
+    mutating func firstFrame() {
+        guard !didLogFirstFrame else { return }
+        didLogFirstFrame = true
+        print("[Startup] video=\(videoId) first_frame_ms=\(elapsedMs())")
+    }
+}

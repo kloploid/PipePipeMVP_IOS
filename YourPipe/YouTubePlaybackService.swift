@@ -46,6 +46,7 @@ actor YouTubePlaybackService {
     private var nDecoderCache: [String: String] = [:]   // playerId → func body
 
     private let nonceAlphabet = Array("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_")
+    private let resolveTimeout: TimeInterval = 8
 
     init(session: URLSession = .shared) {
         self.session = session
@@ -61,6 +62,12 @@ actor YouTubePlaybackService {
         let description: String?
         let headers: [String: String]
         let playerId: String?
+        let resolvedClient: String
+    }
+
+    enum ResolveStrategy {
+        case fastest
+        case exclude(client: String)
     }
 
     enum PlaybackError: LocalizedError {
@@ -86,30 +93,59 @@ actor YouTubePlaybackService {
     // MARK: - Public API
 
     /// Tries ANDROID_VR → ANDROID → IOS in order. First success wins.
-    func resolve(videoId: String) async throws -> PlaybackData {
+    func resolve(videoId: String, strategy: ResolveStrategy = .fastest) async throws -> PlaybackData {
         startVisitorDataFetchIfNeeded()
 
-        // 1. ANDROID_VR — prefers muxed MP4, usually more stable than IOS HLS.
-        if let result = try? await resolveViaAndroidVR(videoId: videoId) {
-#if DEBUG
-            print("[YT] resolved via ANDROID_VR client")
-#endif
-            return result
+        if case .exclude(let excludedClient) = strategy {
+            return try await resolveWithExcludedClient(videoId: videoId, excludedClient: excludedClient)
         }
 
-        // 2. ANDROID client — additional fallback.
-        if let result = try? await resolveViaAndroid(videoId: videoId) {
+        var failures: [String] = []
+        if let result = await withTaskGroup(of: ClientAttempt.self, returning: PlaybackData?.self) { group in
+            group.addTask {
+                do {
+                    return .success(label: "ANDROID_VR", data: try await self.resolveViaAndroidVR(videoId: videoId))
+                } catch {
+                    return .failure(label: "ANDROID_VR", reason: error.localizedDescription)
+                }
+            }
+            group.addTask {
+                do {
+                    return .success(label: "ANDROID", data: try await self.resolveViaAndroid(videoId: videoId))
+                } catch {
+                    return .failure(label: "ANDROID", reason: error.localizedDescription)
+                }
+            }
+
+            while let attempt = await group.next() {
+                switch attempt {
+                case .success(let label, let data):
 #if DEBUG
-            print("[YT] resolved via ANDROID client")
+                    print("[YT] resolved via \(label) client")
 #endif
+                    group.cancelAll()
+                    return data
+                case .failure(let label, let reason):
+                    failures.append("\(label): \(reason)")
+                }
+            }
+            return nil
+        } {
             return result
         }
 
         // 3. IOS client — last resort (can hit 403 on HLS segments for some videos/IPs).
 #if DEBUG
+        if !failures.isEmpty {
+            print("[YT] primary clients failed: \(failures.joined(separator: " | "))")
+        }
         print("[YT] falling back to IOS client")
 #endif
         return try await resolveViaIOS(videoId: videoId)
+    }
+
+    func warmup() {
+        startVisitorDataFetchIfNeeded()
     }
 
     private func startVisitorDataFetchIfNeeded() {
@@ -170,7 +206,7 @@ actor YouTubePlaybackService {
     private func resolveViaIOS(videoId: String) async throws -> PlaybackData {
         guard let url = URL(string: playerEndpoint) else { throw PlaybackError.invalidURL }
 
-        var req = URLRequest(url: url, timeoutInterval: 15)
+        var req = URLRequest(url: url, timeoutInterval: resolveTimeout)
         req.httpMethod = "POST"
         req.setValue("application/json",  forHTTPHeaderField: "Content-Type")
         req.setValue(iosUserAgent,        forHTTPHeaderField: "User-Agent")
@@ -219,34 +255,30 @@ actor YouTubePlaybackService {
         let desc      = details?["shortDescription"] as? String
 
         let streaming = root["streamingData"] as? [String: Any]
-        let playerId: String? = extractPlayerId(from: root)
+        var playerId: String? = extractPlayerId(from: root)
+        if playerId == nil, requiresNDecoding(in: streaming) {
+            playerId = await fetchPlayerIdFromWatchPage(videoId: videoId)
+        }
         let headers   = iosStreamHeaders(videoId: videoId)
 
 
         if let hlsStr = streaming?["hlsManifestUrl"] as? String,
            let hlsURL = URL(string: hlsStr) {
             let decoded = await decodeThrottlingIfNeeded(url: hlsURL, playerId: playerId)
-            // Probe the manifest before committing — lets the waterfall fall through on 403
-            guard await isStreamAccessible(decoded) else {
-#if DEBUG
-                print("[YT/IOS] HLS manifest returned non-2xx — skipping IOS client")
-#endif
-                throw PlaybackError.noPlayableStream
-            }
 #if DEBUG
             print("[YT/IOS] using HLS: \(decoded)")
 #endif
             return PlaybackData(streamURL: decoded, title: title, channelName: channel,
                                 channelId: channelId, description: desc,
-                                headers: headers, playerId: playerId)
+                                headers: headers, playerId: playerId, resolvedClient: iosClientName)
         }
 
         // IOS sometimes returns adaptive formats instead of HLS
         let formats = streaming?["formats"] as? [[String: Any]] ?? []
-        if let muxURL = await pickBestMuxedURL(from: formats, playerId: playerId) {
+        if let muxURL = await pickBestMuxedURL(from: formats, playerId: playerId, startupPreferred: true) {
             return PlaybackData(streamURL: muxURL, title: title, channelName: channel,
                                 channelId: channelId, description: desc,
-                                headers: headers, playerId: playerId)
+                                headers: headers, playerId: playerId, resolvedClient: iosClientName)
         }
 
         throw PlaybackError.noPlayableStream
@@ -257,7 +289,7 @@ actor YouTubePlaybackService {
     private func resolveViaAndroidVR(videoId: String) async throws -> PlaybackData {
         guard let url = URL(string: playerEndpoint) else { throw PlaybackError.invalidURL }
 
-        var req = URLRequest(url: url, timeoutInterval: 15)
+        var req = URLRequest(url: url, timeoutInterval: resolveTimeout)
         req.httpMethod = "POST"
         req.setValue("application/json",  forHTTPHeaderField: "Content-Type")
         req.setValue(vrUserAgent,         forHTTPHeaderField: "User-Agent")
@@ -303,25 +335,27 @@ actor YouTubePlaybackService {
         let isLive    = details?["isLiveContent"] as? Bool ?? false
 
         let streaming = root["streamingData"] as? [String: Any]
-        let playerId: String? = extractPlayerId(from: root)
+        var playerId: String? = extractPlayerId(from: root)
+        if playerId == nil, requiresNDecoding(in: streaming) {
+            playerId = await fetchPlayerIdFromWatchPage(videoId: videoId)
+        }
         let headers   = androidStreamHeaders(videoId: videoId, userAgent: vrUserAgent)
 
         // Muxed MP4 first — direct URL, no HLS proxy, far less 403-prone
         let formats = streaming?["formats"] as? [[String: Any]] ?? []
-        if !isLive, let muxURL = await pickBestMuxedURL(from: formats, playerId: playerId) {
+        if !isLive, let muxURL = await pickBestMuxedURL(from: formats, playerId: playerId, startupPreferred: true) {
             return PlaybackData(streamURL: muxURL, title: title, channelName: channel,
                                 channelId: channelId, description: desc,
-                                headers: headers, playerId: playerId)
+                                headers: headers, playerId: playerId, resolvedClient: vrClientName)
         }
 
         // HLS fallback (live streams, or no muxed formats available)
         if let hlsStr = streaming?["hlsManifestUrl"] as? String,
            let hlsURL = URL(string: hlsStr) {
             let decoded = await decodeThrottlingIfNeeded(url: hlsURL, playerId: playerId)
-            guard await isStreamAccessible(decoded) else { throw PlaybackError.noPlayableStream }
             return PlaybackData(streamURL: decoded, title: title, channelName: channel,
                                 channelId: channelId, description: desc,
-                                headers: headers, playerId: playerId)
+                                headers: headers, playerId: playerId, resolvedClient: vrClientName)
         }
 
         throw PlaybackError.noPlayableStream
@@ -332,7 +366,7 @@ actor YouTubePlaybackService {
     private func resolveViaAndroid(videoId: String) async throws -> PlaybackData {
         guard let url = URL(string: playerEndpoint) else { throw PlaybackError.invalidURL }
 
-        var req = URLRequest(url: url, timeoutInterval: 15)
+        var req = URLRequest(url: url, timeoutInterval: resolveTimeout)
         req.httpMethod = "POST"
         req.setValue("application/json",   forHTTPHeaderField: "Content-Type")
         req.setValue(androidUserAgent,     forHTTPHeaderField: "User-Agent")
@@ -378,25 +412,27 @@ actor YouTubePlaybackService {
         let isLive    = details?["isLiveContent"] as? Bool ?? false
 
         let streaming = root["streamingData"] as? [String: Any]
-        let playerId: String? = extractPlayerId(from: root)
+        var playerId: String? = extractPlayerId(from: root)
+        if playerId == nil, requiresNDecoding(in: streaming) {
+            playerId = await fetchPlayerIdFromWatchPage(videoId: videoId)
+        }
         let headers   = androidStreamHeaders(videoId: videoId, userAgent: androidUserAgent)
 
         // Muxed MP4 first — direct URL, no HLS proxy, far less 403-prone
         let formats = streaming?["formats"] as? [[String: Any]] ?? []
-        if !isLive, let muxURL = await pickBestMuxedURL(from: formats, playerId: playerId) {
+        if !isLive, let muxURL = await pickBestMuxedURL(from: formats, playerId: playerId, startupPreferred: true) {
             return PlaybackData(streamURL: muxURL, title: title, channelName: channel,
                                 channelId: channelId, description: desc,
-                                headers: headers, playerId: playerId)
+                                headers: headers, playerId: playerId, resolvedClient: androidClientName)
         }
 
         // HLS fallback (live streams, or no muxed formats available)
         if let hlsStr = streaming?["hlsManifestUrl"] as? String,
            let hlsURL = URL(string: hlsStr) {
             let decoded = await decodeThrottlingIfNeeded(url: hlsURL, playerId: playerId)
-            guard await isStreamAccessible(decoded) else { throw PlaybackError.noPlayableStream }
             return PlaybackData(streamURL: decoded, title: title, channelName: channel,
                                 channelId: channelId, description: desc,
-                                headers: headers, playerId: playerId)
+                                headers: headers, playerId: playerId, resolvedClient: androidClientName)
         }
 
         throw PlaybackError.noPlayableStream
@@ -427,23 +463,53 @@ actor YouTubePlaybackService {
 
     // MARK: - Stream selection
 
-    private func pickBestMuxedURL(from formats: [[String: Any]], playerId: String?) async -> URL? {
+    private func pickBestMuxedURL(
+        from formats: [[String: Any]],
+        playerId: String?,
+        startupPreferred: Bool
+    ) async -> URL? {
         let muxed = formats.filter {
             guard let mime = $0["mimeType"] as? String else { return false }
             let m = mime.lowercased()
             return m.contains("video/mp4") && m.contains("avc1") && m.contains("mp4a")
         }
-        if let itag18 = muxed.first(where: { ($0["itag"] as? Int) == 18 }),
-           let url = await resolveURL(from: itag18, playerId: playerId) { return url }
-
-        let sorted = muxed.sorted {
-            let lw = $0["width"] as? Int ?? 0; let rw = $1["width"] as? Int ?? 0
-            return lw == rw ? (($0["bitrate"] as? Int ?? 0) > ($1["bitrate"] as? Int ?? 0)) : lw > rw
+        let ranked = muxed.sorted { lhs, rhs in
+            formatScore(lhs, startupPreferred: startupPreferred) > formatScore(rhs, startupPreferred: startupPreferred)
         }
-        for item in sorted {
+        for item in ranked.prefix(6) {
+            guard let url = await resolveURL(from: item, playerId: playerId) else { continue }
+            if hasRateBypass(url) { return url }
+        }
+        for item in ranked {
             if let url = await resolveURL(from: item, playerId: playerId) { return url }
         }
         return nil
+    }
+
+    private func formatScore(_ item: [String: Any], startupPreferred: Bool) -> Int {
+        let width = item["width"] as? Int ?? 0
+        let bitrate = item["bitrate"] as? Int ?? 0
+        let itag = item["itag"] as? Int ?? -1
+        var score = 0
+        if itag == 18 { score += 140 }
+        if startupPreferred {
+            if width <= 480 { score += 90 }
+            else if width <= 720 { score += 55 }
+            else { score += 20 }
+            score += min(bitrate / 80_000, 40)
+        } else {
+            score += min(width / 8, 180)
+            score += min(bitrate / 60_000, 80)
+        }
+        return score
+    }
+
+    private func hasRateBypass(_ url: URL) -> Bool {
+        guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              let items = components.queryItems else {
+            return false
+        }
+        return items.contains { $0.name == "ratebypass" && ($0.value ?? "").lowercased() == "yes" }
     }
 
     private func resolveURL(from item: [String: Any], playerId: String?) async -> URL? {
@@ -657,7 +723,7 @@ actor YouTubePlaybackService {
 
     private func fetchPlayerIdFromPage(urlString: String, userAgent: String) async -> String? {
         guard let url = URL(string: urlString) else { return nil }
-        var req = URLRequest(url: url, timeoutInterval: 10)
+        var req = URLRequest(url: url, timeoutInterval: 4)
         req.setValue(userAgent, forHTTPHeaderField: "User-Agent")
         req.setValue("CONSENT=YES+cb.20231221-07-p0.en+FX+; SOCS=CAE=", forHTTPHeaderField: "Cookie")
         do {
@@ -677,22 +743,29 @@ actor YouTubePlaybackService {
         return String(String(text[range]).prefix(8))
     }
 
-    // MARK: - Helpers
+    private func requiresNDecoding(in streaming: [String: Any]?) -> Bool {
+        guard let streaming else { return false }
+        let formats = (streaming["formats"] as? [[String: Any]] ?? [])
+            + (streaming["adaptiveFormats"] as? [[String: Any]] ?? [])
 
-    /// HEAD-request probe — returns true if the URL responds with 2xx.
-    /// Pre-signed CDN URLs need no custom headers, so we probe with just User-Agent.
-    private func isStreamAccessible(_ url: URL) async -> Bool {
-        var req = URLRequest(url: url, timeoutInterval: 6)
-        req.httpMethod = "HEAD"
-        req.setValue(iosUserAgent, forHTTPHeaderField: "User-Agent")
-        do {
-            let (_, response) = try await session.data(for: req)
-            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-            return (200...299).contains(status)
-        } catch {
-            return false
+        for format in formats {
+            if let urlString = format["url"] as? String,
+               urlString.contains("n=") {
+                return true
+            }
+            if let cipher = format["signatureCipher"] as? String,
+               cipher.contains("n%3D") || cipher.contains("n=") {
+                return true
+            }
+            if let cipher = format["cipher"] as? String,
+               cipher.contains("n%3D") || cipher.contains("n=") {
+                return true
+            }
         }
+        return false
     }
+
+    // MARK: - Helpers
 
     private func randomCPN() -> String {
         String((0..<16).map { _ in nonceAlphabet.randomElement()! })
@@ -719,6 +792,25 @@ actor YouTubePlaybackService {
         if let vd = visitorData { h["X-Goog-Visitor-Id"] = vd }
         return h
     }
+
+    private func resolveWithExcludedClient(videoId: String, excludedClient: String) async throws -> PlaybackData {
+        var failures: [String] = []
+
+        if excludedClient != vrClientName {
+            do { return try await resolveViaAndroidVR(videoId: videoId) }
+            catch { failures.append("\(vrClientName): \(error.localizedDescription)") }
+        }
+        if excludedClient != androidClientName {
+            do { return try await resolveViaAndroid(videoId: videoId) }
+            catch { failures.append("\(androidClientName): \(error.localizedDescription)") }
+        }
+        if excludedClient != iosClientName {
+            do { return try await resolveViaIOS(videoId: videoId) }
+            catch { failures.append("\(iosClientName): \(error.localizedDescription)") }
+        }
+
+        throw PlaybackError.notPlayable(failures.joined(separator: " | "))
+    }
 }
 
 // MARK: - Debug logging
@@ -739,3 +831,8 @@ private extension YouTubePlaybackService {
     }
 }
 #endif
+
+private enum ClientAttempt {
+    case success(label: String, data: YouTubePlaybackService.PlaybackData)
+    case failure(label: String, reason: String)
+}

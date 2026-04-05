@@ -9,6 +9,7 @@ struct ResolvedPlayback {
     let headers: [String: String]
     let playerId: String?
     let sourceLabel: String
+    let directClientLabel: String?
 }
 
 enum PlaybackResolveError: LocalizedError {
@@ -26,16 +27,20 @@ enum PlaybackResolveError: LocalizedError {
 }
 
 private actor DirectYouTubePlaybackProvider {
-    let sourceLabel = "YouTube Direct"
-
     private let service: YouTubePlaybackService
 
     init(service: YouTubePlaybackService = .shared) {
         self.service = service
     }
 
-    func resolve(videoId: String) async throws -> ResolvedPlayback {
-        let data = try await service.resolve(videoId: videoId)
+    func resolve(videoId: String, excludingClient: String? = nil) async throws -> ResolvedPlayback {
+        let data: YouTubePlaybackService.PlaybackData
+        if let excludingClient, !excludingClient.isEmpty {
+            data = try await service.resolve(videoId: videoId, strategy: .exclude(client: excludingClient))
+        } else {
+            data = try await service.resolve(videoId: videoId, strategy: .fastest)
+        }
+        let sourceLabel = "YouTube Direct (\(data.resolvedClient))"
         return ResolvedPlayback(
             streamURL: data.streamURL,
             title: data.title,
@@ -44,7 +49,8 @@ private actor DirectYouTubePlaybackProvider {
             description: data.description,
             headers: data.headers,
             playerId: data.playerId,
-            sourceLabel: sourceLabel
+            sourceLabel: sourceLabel,
+            directClientLabel: data.resolvedClient
         )
     }
 }
@@ -128,7 +134,8 @@ private actor PipedPlaybackProvider {
             description: dto.description,
             headers: [:],
             playerId: nil,
-            sourceLabel: sourceLabel
+            sourceLabel: sourceLabel,
+            directClientLabel: nil
         )
     }
 
@@ -180,28 +187,40 @@ actor PlaybackResolver {
     private let pipedProvider: PipedPlaybackProvider
     private var cache: [String: CachedResolvedPlayback] = [:]
     private var inflight: [String: Task<ResolvedPlayback, Error>] = [:]
+    private var prefetchInflight: [String: Task<Void, Never>] = [:]
 
     private init() {
         self.directProvider = DirectYouTubePlaybackProvider()
         self.pipedProvider = PipedPlaybackProvider()
     }
 
-    func resolve(videoId: String, mode: PlaybackSourceMode) async throws -> ResolvedPlayback {
+    func resolve(
+        videoId: String,
+        mode: PlaybackSourceMode,
+        forceRefresh: Bool = false,
+        excludingDirectClient: String? = nil
+    ) async throws -> ResolvedPlayback {
         let key = cacheKey(videoId: videoId, mode: mode)
 
-        if let cached = cache[key], !cached.isExpired {
+        if !forceRefresh, let cached = cache[key], !cached.isExpired {
             return cached.playback
         }
 
-        if let task = inflight[key] {
+        if !forceRefresh, let task = inflight[key] {
             return try await task.value
+        }
+
+        if forceRefresh {
+            cache[key] = nil
+            inflight[key]?.cancel()
+            inflight[key] = nil
         }
 
         let task = Task<ResolvedPlayback, Error> {
             switch mode {
             case .auto:
                 do {
-                    return try await directProvider.resolve(videoId: videoId)
+                    return try await directProvider.resolve(videoId: videoId, excludingClient: excludingDirectClient)
                 } catch {
                     let firstError = "YouTube Direct: \(error.localizedDescription)"
                     do {
@@ -213,7 +232,7 @@ actor PlaybackResolver {
                 }
             case .direct:
                 do {
-                    return try await directProvider.resolve(videoId: videoId)
+                    return try await directProvider.resolve(videoId: videoId, excludingClient: excludingDirectClient)
                 } catch {
                     throw PlaybackResolveError.unableToResolve(["YouTube Direct: \(error.localizedDescription)"])
                 }
@@ -243,7 +262,19 @@ actor PlaybackResolver {
     }
 
     func prefetch(videoId: String, mode: PlaybackSourceMode) async {
-        _ = try? await resolve(videoId: videoId, mode: mode)
+        let key = cacheKey(videoId: videoId, mode: mode)
+        if let task = prefetchInflight[key] {
+            await task.value
+            return
+        }
+
+        let task = Task<Void, Never> {
+            guard let playback = try? await self.resolve(videoId: videoId, mode: mode) else { return }
+            await self.warmupFirstByte(for: playback)
+        }
+        prefetchInflight[key] = task
+        await task.value
+        prefetchInflight[key] = nil
     }
 
     private func cacheKey(videoId: String, mode: PlaybackSourceMode) -> String {
@@ -258,6 +289,27 @@ actor PlaybackResolver {
             return Date(timeIntervalSince1970: unix - 30)
         }
         return Date().addingTimeInterval(120)
+    }
+
+    private func warmupFirstByte(for playback: ResolvedPlayback) async {
+        var request = URLRequest(url: playback.streamURL, timeoutInterval: 3)
+        request.httpMethod = "GET"
+        request.setValue("bytes=0-1023", forHTTPHeaderField: "Range")
+
+        let headers = effectiveHeadersForWarmup(url: playback.streamURL, headers: playback.headers)
+        for (key, value) in headers {
+            request.setValue(value, forHTTPHeaderField: key)
+        }
+
+        _ = try? await URLSession.shared.data(for: request)
+    }
+
+    private func effectiveHeadersForWarmup(url: URL, headers: [String: String]) -> [String: String] {
+        guard let host = url.host?.lowercased() else { return headers }
+        if host == "manifest.googlevideo.com" || host.hasSuffix(".googlevideo.com") {
+            return [:]
+        }
+        return headers
     }
 }
 

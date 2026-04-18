@@ -1,7 +1,10 @@
-# Builds the YourPipe iOS app on macOS runners.
-# This is an Xcode project (XcodeGen-generated .xcodeproj) — not a Swift
-# Package — so we invoke `xcodebuild` directly. `swift build` would look for
-# a Package.swift at the repo root and fail.
+# Builds the YourPipe iOS app and publishes an unsigned .ipa as a workflow
+# artifact. This is an Xcode project (XcodeGen-generated .xcodeproj) — not a
+# Swift Package — so we invoke `xcodebuild` directly.
+#
+# The .ipa is unsigned: it can't be installed directly on a non-jailbroken
+# device. To sideload it, use a tool like AltStore or Sideloadly — they
+# re-sign the .ipa locally with your personal Apple ID (7-day cert).
 
 name: Build
 
@@ -10,6 +13,8 @@ on:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
+  # Allow triggering manually from the Actions tab.
+  workflow_dispatch:
 
 jobs:
   build:
@@ -21,15 +26,68 @@ jobs:
       - name: Show Xcode version
         run: xcodebuild -version
 
+      # Sanity-check build on the simulator. Fast, catches most compile errors
+      # without needing any of the device-build fiddling below.
       - name: Build (iOS Simulator)
         run: |
           set -o pipefail
           xcodebuild \
             -project YourPipe.xcodeproj \
             -scheme YourPipe \
-            -configuration Debug \
+            -configuration Release \
             -destination 'generic/platform=iOS Simulator' \
             -skipPackagePluginValidation \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             build
+
+      # Archive for a real iOS device. This is the only build that produces
+      # an .app bundle packageable as .ipa (simulator .app bundles contain
+      # x86_64/arm64-simulator slices that the real-device loader rejects).
+      #
+      # `CODE_SIGNING_ALLOWED=NO` + `CODE_SIGN_IDENTITY=""` keep the archive
+      # unsigned, so no Apple Developer account / secrets are needed.
+      - name: Archive (iOS Device, unsigned)
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project YourPipe.xcodeproj \
+            -scheme YourPipe \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath build/YourPipe.xcarchive \
+            -skipPackagePluginValidation \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGN_ENTITLEMENTS="" \
+            archive
+
+      # Manually package the .app into .ipa format. The "proper" way is
+      # `xcodebuild -exportArchive`, but that insists on a signing identity
+      # even with exportOptionsPlist.method = development. The IPA format is
+      # just a zip of `Payload/<AppName>.app`, so we do that directly.
+      - name: Package .ipa
+        run: |
+          set -euo pipefail
+          APP_PATH="build/YourPipe.xcarchive/Products/Applications/YourPipe.app"
+          if [ ! -d "$APP_PATH" ]; then
+            echo "::error::Archived .app not found at $APP_PATH"
+            ls -R build/YourPipe.xcarchive || true
+            exit 1
+          fi
+          mkdir -p build/ipa/Payload
+          cp -R "$APP_PATH" build/ipa/Payload/
+          cd build/ipa
+          zip -qry ../YourPipe-unsigned.ipa Payload
+          cd ../..
+          ls -lh build/YourPipe-unsigned.ipa
+
+      - name: Upload .ipa artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: YourPipe-unsigned-ipa
+          path: build/YourPipe-unsigned.ipa
+          # Artifacts older than this are auto-deleted; free tier is up to 90 days.
+          retention-days: 30
+          if-no-files-found: error

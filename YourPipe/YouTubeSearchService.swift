@@ -258,7 +258,28 @@ actor YouTubeSearchService {
     }
 }
 
-private extension YouTubeSearchService {
+extension YouTubeSearchService {
+    /// Exposes the validated InnerTube access tuple so that other services
+    /// (comments, channel-about, etc.) can reuse the same key/client-version
+    /// negotiation instead of duplicating the `sw.js` scrape + /guide probe.
+    /// Returns fallback values if the live extraction fails — matches search's
+    /// own behaviour.
+    func innertubeAccess() async -> (apiKey: String, clientVersion: String) {
+        let config = try? await loadWebConfig()
+        let resolved = config ?? WebConfig(key: fallbackKey, clientVersion: fallbackClientVersion)
+        return (resolved.key, resolved.clientVersion)
+    }
+
+    /// Builds the standard WEB InnerTube `context.client` block used across
+    /// the app. Shared entry point so every InnerTube call presents the same
+    /// fingerprint (locale, platform, client version).
+    func innertubeContext(locale: Locale = .current) async -> [String: Any] {
+        let (_, clientVersion) = await innertubeAccess()
+        return makeContext(clientVersion: clientVersion, locale: locale)
+    }
+}
+
+extension YouTubeSearchService {
     struct WebConfig {
         let key: String
         let clientVersion: String

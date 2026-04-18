@@ -716,15 +716,15 @@ final class PlaybackController: NSObject, ObservableObject {
     private func ensureAudioSessionActive() {
         let session = AVAudioSession.sharedInstance()
         do {
-            // `.moviePlayback` is the AVAudioSession.Mode designed for apps
-            // that play movies / video-with-audio. It tells iOS to route the
-            // Now Playing widget through the video-player variant, which
-            // reliably renders transport icons. `.default` leaves the
-            // widget's icon rendering in an ambiguous state on some iOS
-            // builds (tap regions present, glyphs missing).
+            // `.default` mode tells iOS to treat this like a music player for
+            // Now Playing purposes, which is what gets the lock-screen widget
+            // to render the full transport icon set. `.moviePlayback` used to
+            // work on iOS 16–17 but on iOS 26 the system classifies the
+            // session as a video player and drops the music-style widget,
+            // leaving tap regions without glyphs.
             try session.setCategory(
                 .playback,
-                mode: .moviePlayback
+                mode: .default
             )
             try session.setActive(true)
 #if DEBUG
@@ -808,12 +808,12 @@ final class PlaybackController: NSObject, ObservableObject {
             self.updateNowPlayingInfo()
             return .success
         }
-        commandCenter.togglePlayPauseCommand.isEnabled = true
-        commandCenter.togglePlayPauseCommand.addTarget { [weak self] _ in
-            guard let self else { return .commandFailed }
-            self.togglePlayPause()
-            return .success
-        }
+        // Do NOT register a target on togglePlayPauseCommand. When
+        // play/pause each have their own targets, iOS auto-dispatches toggle
+        // to the state-appropriate one. Having all three targets registered
+        // makes iOS 18 leave the play/pause slot as a tap-region without a
+        // glyph (tap fires but the icon never renders) — the exact symptom
+        // we were seeing on the lock-screen widget.
         commandCenter.changePlaybackPositionCommand.isEnabled = true
         commandCenter.changePlaybackPositionCommand.addTarget { [weak self] event in
             guard let self, let player = self.player,
@@ -884,15 +884,25 @@ final class PlaybackController: NSObject, ObservableObject {
 
     private func startTickTimer() {
         tickTimer?.invalidate()
+        // Only refresh the published play-state flag here. We used to also
+        // rewrite `nowPlayingInfo` every tick, but iOS 26 reads frequent full
+        // rewrites as an unstable session and refuses to render transport
+        // icons. The widget derives elapsed time from rate × timestamp, so
+        // setting nowPlayingInfo on play/pause/seek/stop (already done) is
+        // sufficient. Only push a new dict if the actual play-state flipped.
         tickTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
                 guard let self else { return }
+                let newState: Bool
                 if let player = self.player {
-                    self.isPlayingState = (player.timeControlStatus == .playing)
+                    newState = (player.timeControlStatus == .playing)
                 } else {
-                    self.isPlayingState = false
+                    newState = false
                 }
-                self.updateNowPlayingInfo()
+                if newState != self.isPlayingState {
+                    self.isPlayingState = newState
+                    self.updateNowPlayingInfo()
+                }
             }
         }
         RunLoop.main.add(tickTimer!, forMode: .common)
@@ -918,8 +928,15 @@ final class PlaybackController: NSObject, ObservableObject {
             MPMediaItemPropertyTitle: title ?? "Без названия",
             MPMediaItemPropertyArtist: channelName ?? "Канал",
             MPNowPlayingInfoPropertyPlaybackRate: isPlaying ? 1.0 : 0.0,
+            MPNowPlayingInfoPropertyDefaultPlaybackRate: 1.0,
             MPNowPlayingInfoPropertyElapsedPlaybackTime: elapsed,
-            MPNowPlayingInfoPropertyMediaType: MPNowPlayingInfoMediaType.audio.rawValue
+            MPNowPlayingInfoPropertyMediaType: MPNowPlayingInfoMediaType.audio.rawValue,
+            // Explicitly mark as VOD. If left unset while `duration` is
+            // briefly NaN during HLS manifest resolve, iOS 17+ falls back to
+            // treating it as a live stream and hides the seek bar / swaps
+            // transport icons for a live variant — which on the lock screen
+            // reads as "tap regions without glyphs".
+            MPNowPlayingInfoPropertyIsLiveStream: false
         ]
 
         if let rawDuration = player?.currentItem?.duration.seconds,

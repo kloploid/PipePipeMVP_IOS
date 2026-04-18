@@ -86,6 +86,10 @@ struct VideoPlaybackScreen: View {
                                         for: playback.title ?? item.title,
                                         excluding: playback.currentVideoId
                                     )
+                                    await details.loadComments(
+                                        for: playback.currentVideoId,
+                                        force: true
+                                    )
                                 }
                             }
                         )
@@ -118,6 +122,11 @@ struct VideoPlaybackScreen: View {
                     for: playback.title ?? initialTitle,
                     excluding: playback.currentVideoId
                 )
+                // Pre-warm comments in the background so they're ready the
+                // moment the user taps the Comments tab. Safe to run even when
+                // the user never visits the tab — the fetch costs one /next
+                // round-trip and is cached per-videoId in the view-model.
+                await details.loadComments(for: playback.currentVideoId ?? videoId)
             }
             .onChange(of: playback.title) { newTitle in
                 guard let newTitle, !newTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
@@ -128,6 +137,26 @@ struct VideoPlaybackScreen: View {
                         for: newTitle,
                         excluding: playback.currentVideoId
                     )
+                }
+            }
+            .onChange(of: playback.currentVideoId) { newVideoId in
+                // Video changed (e.g. user tapped a related card). Invalidate
+                // and refetch comments for the new id.
+                Task {
+                    await details.loadComments(for: newVideoId, force: true)
+                }
+            }
+            .onChange(of: selectedSection) { newSection in
+                // Re-try if the user switches to Comments after a previous
+                // failure (e.g. transient network error on first attempt).
+                guard newSection == .comments else { return }
+                if details.comments.isEmpty, !details.isLoadingComments {
+                    Task {
+                        await details.loadComments(
+                            for: playback.currentVideoId ?? videoId,
+                            force: true
+                        )
+                    }
                 }
             }
         }
@@ -199,11 +228,24 @@ private final class VideoDetailsViewModel: ObservableObject {
     @Published var isLoadingComments = false
     @Published var commentsError: String?
 
-    private let searchService: YouTubeSearchService
-    private var lastRelatedKey: String?
+    // Replies state, keyed by parent commentId. Persisted across the Comments
+    // tab's lifetime so collapsing + re-expanding doesn't re-hit the network.
+    @Published var repliesByParent: [String: [VideoComment]] = [:]
+    @Published var expandedReplyParents: Set<String> = []
+    @Published var loadingReplyParents: Set<String> = []
+    @Published var repliesErrorByParent: [String: String] = [:]
 
-    init(searchService: YouTubeSearchService = .shared) {
+    private let searchService: YouTubeSearchService
+    private let commentsService: YouTubeCommentsService
+    private var lastRelatedKey: String?
+    private var lastCommentsVideoId: String?
+
+    init(
+        searchService: YouTubeSearchService = .shared,
+        commentsService: YouTubeCommentsService = .shared
+    ) {
         self.searchService = searchService
+        self.commentsService = commentsService
     }
 
     func loadRelated(for query: String, excluding videoId: String?) async {
@@ -232,14 +274,95 @@ private final class VideoDetailsViewModel: ObservableObject {
 
         isLoadingRelated = false
     }
-}
 
-private struct VideoComment: Identifiable, Equatable {
-    let id: String
-    let author: String
-    let text: String
-    let likeCountText: String?
-    let publishedText: String?
+    /// Loads the top-ranked comments for `videoId`. Idempotent per-video so the
+    /// user can flip between the Description/Comments/Related tabs without
+    /// hammering the network.
+    func loadComments(for videoId: String?, force: Bool = false) async {
+        guard let videoId, !videoId.isEmpty else {
+            comments = []
+            lastCommentsVideoId = nil
+            isLoadingComments = false
+            commentsError = nil
+            return
+        }
+        if !force, lastCommentsVideoId == videoId, !comments.isEmpty {
+            return
+        }
+        if isLoadingComments, lastCommentsVideoId == videoId {
+            return
+        }
+
+        lastCommentsVideoId = videoId
+        isLoadingComments = true
+        commentsError = nil
+        // New video — purge any stale replies state so we don't render replies
+        // that belong to the previously-viewed comment list.
+        repliesByParent = [:]
+        expandedReplyParents = []
+        loadingReplyParents = []
+        repliesErrorByParent = [:]
+
+        do {
+            let fetched = try await commentsService.fetchTopComments(videoId: videoId)
+            // Guard against a stale response after the user jumps to a
+            // different video while the request was in flight.
+            guard lastCommentsVideoId == videoId else {
+                isLoadingComments = false
+                return
+            }
+            comments = fetched
+            if fetched.isEmpty {
+                commentsError = "Комментарии пока не найдены."
+            }
+        } catch {
+            guard lastCommentsVideoId == videoId else {
+                isLoadingComments = false
+                return
+            }
+            comments = []
+            commentsError = error.localizedDescription
+        }
+
+        isLoadingComments = false
+    }
+
+    /// Toggles the replies section for `comment`. First expansion fetches the
+    /// replies; subsequent toggles are local-only (cached).
+    func toggleReplies(for comment: VideoComment) async {
+        let parentId = comment.id
+        if expandedReplyParents.contains(parentId) {
+            expandedReplyParents.remove(parentId)
+            return
+        }
+        expandedReplyParents.insert(parentId)
+        repliesErrorByParent[parentId] = nil
+
+        // Already loaded — nothing more to do; just unhide.
+        if repliesByParent[parentId] != nil { return }
+        guard let token = comment.repliesContinuationToken else {
+            repliesErrorByParent[parentId] = "Ответы недоступны."
+            return
+        }
+        if loadingReplyParents.contains(parentId) { return }
+
+        loadingReplyParents.insert(parentId)
+        defer { loadingReplyParents.remove(parentId) }
+
+        do {
+            let replies = try await commentsService.fetchReplies(continuationToken: token)
+            // Drop the result if the user collapsed the thread (or switched
+            // videos) while the request was in flight.
+            guard expandedReplyParents.contains(parentId) else { return }
+            repliesByParent[parentId] = replies
+            if replies.isEmpty {
+                repliesErrorByParent[parentId] = "Ответов не найдено."
+            }
+        } catch {
+            guard expandedReplyParents.contains(parentId) else { return }
+            repliesErrorByParent[parentId] = error.localizedDescription
+        }
+    }
 }
 
 private struct VideoHeaderView: View {
@@ -348,25 +471,92 @@ private struct CommentsSection: View {
     @ObservedObject var details: VideoDetailsViewModel
 
     var body: some View {
-        if details.isLoadingComments {
+        if details.isLoadingComments && details.comments.isEmpty {
             ProgressView("Загрузка комментариев...")
-        } else if let error = details.commentsError {
+                .frame(maxWidth: .infinity, alignment: .center)
+                .padding(.vertical, 20)
+        } else if details.comments.isEmpty, let error = details.commentsError {
             SectionPlaceholderView(
-                title: "Не удалось загрузить",
-                systemImage: "exclamationmark.triangle",
+                title: "Комментариев нет",
+                systemImage: "text.bubble",
                 message: error
             )
         } else if details.comments.isEmpty {
             SectionPlaceholderView(
-                title: "Комментарии пока недоступны",
+                title: "Комментариев нет",
                 systemImage: "text.bubble",
-                message: "Добавим загрузку комментариев в следующем шаге."
+                message: "Откройте вкладку «Комментарии», чтобы загрузить обсуждение."
             )
         } else {
             LazyVStack(alignment: .leading, spacing: 12) {
                 ForEach(details.comments) { comment in
-                    CommentRow(comment: comment)
+                    CommentThreadView(comment: comment, details: details)
                 }
+            }
+        }
+    }
+}
+
+private struct CommentThreadView: View {
+    let comment: VideoComment
+    @ObservedObject var details: VideoDetailsViewModel
+
+    private var isExpanded: Bool {
+        details.expandedReplyParents.contains(comment.id)
+    }
+
+    private var isLoadingReplies: Bool {
+        details.loadingReplyParents.contains(comment.id)
+    }
+
+    private var loadedReplies: [VideoComment] {
+        details.repliesByParent[comment.id] ?? []
+    }
+
+    private var replyError: String? {
+        details.repliesErrorByParent[comment.id]
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            CommentRow(comment: comment)
+
+            if comment.replyCount > 0, comment.repliesContinuationToken != nil {
+                Button {
+                    Task { await details.toggleReplies(for: comment) }
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
+                            .font(.caption2.weight(.bold))
+                        Text(isExpanded
+                             ? "Скрыть ответы"
+                             : "Показать ответы (\(comment.replyCount))")
+                            .font(.caption.weight(.semibold))
+                    }
+                    .foregroundStyle(.orange)
+                    .padding(.vertical, 4)
+                }
+                .buttonStyle(.plain)
+                .padding(.leading, 42)
+            }
+
+            if isExpanded {
+                VStack(alignment: .leading, spacing: 8) {
+                    if isLoadingReplies && loadedReplies.isEmpty {
+                        ProgressView()
+                            .controlSize(.small)
+                            .padding(.vertical, 6)
+                    } else if loadedReplies.isEmpty, let replyError {
+                        Text(replyError)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        ForEach(loadedReplies) { reply in
+                            CommentRow(comment: reply)
+                        }
+                    }
+                }
+                .padding(.leading, 42)
             }
         }
     }
@@ -487,26 +677,61 @@ private struct CommentRow: View {
     let comment: VideoComment
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 8) {
-                Circle()
-                    .fill(.gray.opacity(0.2))
-                    .frame(width: 28, height: 28)
-                Text(comment.author)
-                    .font(.subheadline.weight(.semibold))
-                if let published = comment.publishedText {
-                    Text(published)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+        HStack(alignment: .top, spacing: 10) {
+            ChannelAvatarView(
+                avatarURL: comment.authorThumbnailURL,
+                fallbackText: String(comment.author.prefix(1))
+            )
+            .frame(width: 32, height: 32)
+
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    if comment.isPinned {
+                        Image(systemName: "pin.fill")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                    Text(comment.author)
+                        .font(.subheadline.weight(.semibold))
+                        .lineLimit(1)
+                        .foregroundStyle(comment.isChannelOwner ? .orange : .primary)
+                    if comment.isChannelOwner {
+                        Text("Автор")
+                            .font(.caption2.weight(.semibold))
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(.orange.opacity(0.15), in: Capsule())
+                            .foregroundStyle(.orange)
+                    }
+                    if let published = comment.publishedText, !published.isEmpty {
+                        Text(published)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                }
+
+                Text(comment.text)
+                    .font(.body)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+
+                HStack(spacing: 16) {
+                    if let likes = comment.likeCountText, !likes.isEmpty {
+                        Label(likes, systemImage: "hand.thumbsup")
+                            .labelStyle(.titleAndIcon)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    if comment.replyCount > 0 {
+                        Label("\(comment.replyCount)", systemImage: "bubble.left")
+                            .labelStyle(.titleAndIcon)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
                 }
             }
-            Text(comment.text)
-                .font(.body)
-            if let likes = comment.likeCountText {
-                Text(likes)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
         .padding(10)
         .background(.gray.opacity(0.08), in: RoundedRectangle(cornerRadius: 12, style: .continuous))

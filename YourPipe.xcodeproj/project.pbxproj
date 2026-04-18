@@ -12,6 +12,7 @@
 		28D9756EF2EF238D20B33056 /* SubscriptionStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1E07164A301E8AADE637B3BE /* SubscriptionStore.swift */; };
 		2947B92A3CC358058958E2A8 /* PlaybackResolver.swift in Sources */ = {isa = PBXBuildFile; fileRef = 61DBA9E455D42E3917989E99 /* PlaybackResolver.swift */; };
 		3F1D31F15EB387BD5053672A /* YourPipeApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 34388516DEBC7761A5750A24 /* YourPipeApp.swift */; };
+		48E622B85361BE73EE504809 /* YouTubeCommentsService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1490B801F4663050A23EE335 /* YouTubeCommentsService.swift */; };
 		4FDC7A652DBF5B2865D6A1CC /* VideoPlaybackScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = AF5D4C97EB6993D62B6D65B2 /* VideoPlaybackScreen.swift */; };
 		5FF14FF66AC3149E72A19056 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = F817A13A10F29661CE1CD04C /* Assets.xcassets */; };
 		60FCA8C89CBEB18FD42E1627 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C3C82A9E0B6B60BBAB22FD2C /* ContentView.swift */; };
@@ -27,6 +28,7 @@
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
+		1490B801F4663050A23EE335 /* YouTubeCommentsService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = YouTubeCommentsService.swift; sourceTree = "<group>"; };
 		1E07164A301E8AADE637B3BE /* SubscriptionStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SubscriptionStore.swift; sourceTree = "<group>"; };
 		1E7A76F1FDEB617A0772EA43 /* PipePipeDecoderClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PipePipeDecoderClient.swift; sourceTree = "<group>"; };
 		22E47AFF1E6E6D32A4657440 /* AppSettingsStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppSettingsStore.swift; sourceTree = "<group>"; };
@@ -82,6 +84,7 @@
 				1E07164A301E8AADE637B3BE /* SubscriptionStore.swift */,
 				AF5D4C97EB6993D62B6D65B2 /* VideoPlaybackScreen.swift */,
 				34388516DEBC7761A5750A24 /* YourPipeApp.swift */,
+				1490B801F4663050A23EE335 /* YouTubeCommentsService.swift */,
 				46139578BAAAA6C1A99AB805 /* YouTubePlaybackService.swift */,
 				6270D5381961FFEB0ECA0147 /* YouTubeSearchModels.swift */,
 				5674F333091F43153657940E /* YouTubeSearchService.swift */,
@@ -180,6 +183,7 @@
 				AC07F894CDBA6F848D3DFF34 /* SearchViewModel.swift in Sources */,
 				28D9756EF2EF238D20B33056 /* SubscriptionStore.swift in Sources */,
 				4FDC7A652DBF5B2865D6A1CC /* VideoPlaybackScreen.swift in Sources */,
+				48E622B85361BE73EE504809 /* YouTubeCommentsService.swift in Sources */,
 				A3E3127385F838AACB115F90 /* YouTubePlaybackService.swift in Sources */,
 				C8AF736F8C29401355B52EA8 /* YouTubeSearchModels.swift in Sources */,
 				D54B9932B161DA6B14D83E24 /* YouTubeSearchService.swift in Sources */,

@@ -24,6 +24,9 @@ final class HLSProxy: NSObject, AVAssetResourceLoaderDelegate {
     ) -> Bool {
         guard let requestURL = loadingRequest.request.url,
               let original = originalURL(from: requestURL) else {
+            let err = NSError(domain: "HLSProxy", code: -1,
+                              userInfo: [NSLocalizedDescriptionKey: "Invalid proxy request"])
+            loadingRequest.finishLoading(with: err)
             return false
         }
 

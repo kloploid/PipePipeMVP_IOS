@@ -51,7 +51,11 @@ final class PlaybackController: NSObject, ObservableObject {
     private var pipController: AVPictureInPictureController?
     private var hlsProxy: HLSProxy?
     private var isDeviceLocked = false
-    private var artworkCache: [URL: MPMediaItemArtwork] = [:]
+    private var artworkCache: NSCache<NSURL, MPMediaItemArtwork> = {
+        let cache = NSCache<NSURL, MPMediaItemArtwork>()
+        cache.countLimit = 20
+        return cache
+    }()
     private var currentArtwork: MPMediaItemArtwork?
     /// Fallback artwork used while the real thumbnail is still loading.
     /// iOS 17+ requires `MPMediaItemPropertyArtwork` to be present for the
@@ -121,6 +125,7 @@ final class PlaybackController: NSObject, ObservableObject {
     }
 
     deinit {
+        artworkCache.removeAllObjects()
         tickTimer?.invalidate()
     }
 
@@ -281,6 +286,7 @@ final class PlaybackController: NSObject, ObservableObject {
         descriptionText = nil
         currentPlayerId = nil
         currentArtwork = nil
+        artworkCache.removeAllObjects()
         activeSourceLabel = nil
         attemptedPipedRecoveryForVideoId = nil
         isRecoveringViaPiped = false
@@ -967,7 +973,7 @@ final class PlaybackController: NSObject, ObservableObject {
 
     private func loadArtworkIfNeeded() async {
         guard let url = thumbnailURL else { return }
-        if let cached = artworkCache[url] {
+        if let cached = artworkCache.object(forKey: url as NSURL) {
             currentArtwork = cached
             updateNowPlayingInfo()
             return
@@ -977,7 +983,7 @@ final class PlaybackController: NSObject, ObservableObject {
             let (data, _) = try await URLSession.shared.data(from: url)
             if let image = UIImage(data: data) {
                 let artwork = MPMediaItemArtwork(boundsSize: image.size) { _ in image }
-                artworkCache[url] = artwork
+                artworkCache.setObject(artwork, forKey: url as NSURL)
                 currentArtwork = artwork
                 updateNowPlayingInfo()
             }
